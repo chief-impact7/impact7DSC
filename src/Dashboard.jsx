@@ -91,6 +91,9 @@ export default function Dashboard() {
     const [selectedSessionIds, setSelectedSessionIds] = useState(new Set());
     const [showDetailPanel, setShowDetailPanel] = useState(false);
     const [currentSessionId, setCurrentSessionId] = useState(null);
+    const [isSyncing, setIsSyncing] = useState(false);
+
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbzup4-XNufGlQ2m-u9RTfUBsTrwz9FBhZCjNwpjNV--dt4jGdjfEbZ-hiFcKoLq69MhDA/exec";
 
     const currentSession = useMemo(() => sessions.find(s => s.id === currentSessionId), [sessions, currentSessionId]);
 
@@ -205,13 +208,46 @@ export default function Dashboard() {
         return session.checks.summaryConfirmed;
     };
 
-    const handleCheckout = (session) => {
+    const sendDataToGAS = async (data, retryCount = 0) => {
+        setIsSyncing(true);
+        try {
+            const response = await fetch(GAS_URL, {
+                method: 'POST',
+                mode: 'no-cors', // Normal for GAS Web Apps
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    date: new Date().toISOString().split('T')[0],
+                    timestamp: new Date().toISOString(),
+                    ...data
+                })
+            });
+            console.log("Data sent to GAS successfully");
+            return true;
+        } catch (error) {
+            console.error(`Sync failed (Attempt ${retryCount + 1}):`, error);
+            if (retryCount < 5) {
+                const delay = Math.pow(2, retryCount) * 1000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return sendDataToGAS(data, retryCount + 1);
+            }
+            alert("서버 연결에 실패했습니다. 네트워크 상태를 확인해주세요.");
+            return false;
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    const handleCheckout = async (session) => {
         if (!canCheckout(session)) {
             alert("진행 중인 학습에 'X' 또는 '△'가 남아있거나, 최종 확인이 완료되지 않았습니다.");
             return;
         }
-        alert(`${session.name} 학생의 귀가가 승인되었습니다. 데이터가 구글 시트로 전송됩니다.`);
-        // Here we would implement the GAS POST call
+
+        const success = await sendDataToGAS(session);
+        if (success) {
+            alert(`${session.name} 학생의 귀가가 승인되었습니다. 구글 시트 저장이 완료되었습니다.`);
+            setShowDetailPanel(false);
+        }
     };
 
     const copyToClipboard = (text) => {
@@ -353,9 +389,15 @@ export default function Dashboard() {
                                 </button>
                                 <button
                                     onClick={() => handleCheckout(currentSession)}
-                                    className="flex-1 h-12 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-sm transition-all shadow-[0_10px_20px_-5px_rgba(99,102,241,0.5)] flex items-center justify-center gap-2"
+                                    disabled={isSyncing}
+                                    className={`flex-1 h-12 rounded-xl font-bold text-sm transition-all shadow-[0_10px_20px_-5px_rgba(99,102,241,0.5)] flex items-center justify-center gap-2 ${isSyncing ? 'bg-zinc-700 cursor-not-allowed text-zinc-400' : 'bg-indigo-600 hover:bg-indigo-500 text-white'}`}
                                 >
-                                    <LogOut size={16} /> Final Checkout
+                                    {isSyncing ? (
+                                        <div className="w-5 h-5 border-2 border-zinc-500 border-t-white rounded-full animate-spin"></div>
+                                    ) : (
+                                        <LogOut size={16} />
+                                    )}
+                                    {isSyncing ? 'Syncing...' : 'Final Checkout'}
                                 </button>
                             </div>
 
