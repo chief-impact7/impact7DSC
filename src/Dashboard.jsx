@@ -118,10 +118,7 @@ export default function Dashboard() {
     const handleCreateSessions = async (newSessions) => {
         setIsSyncing(true);
         try {
-            // Add to local state first for instant feedback (optimistic)
             setSessions(prev => [...newSessions, ...prev]);
-
-            // Sync each to GAS
             for (const s of newSessions) {
                 await sendDataToGAS({ ...s, _action: 'CREATE' });
             }
@@ -130,6 +127,68 @@ export default function Dashboard() {
             console.error("Session creation failed:", error);
         } finally {
             setIsSyncing(false);
+        }
+    };
+
+    const handleSaveAsNew = async () => {
+        if (sessions.length === 0) return;
+        setIsSyncing(true);
+        try {
+            // Generate timestamp for tab name: YYMMDDHHmm
+            const now = new Date();
+            const timestamp = now.getFullYear().toString().slice(-2) +
+                (now.getMonth() + 1).toString().padStart(2, '0') +
+                now.getDate().toString().padStart(2, '0') +
+                now.getHours().toString().padStart(2, '0') +
+                now.getMinutes().toString().padStart(2, '0');
+
+            // Send all sessions with a special 'SAVE_AS_NEW' action and custom tab name
+            for (const s of sessions) {
+                await sendDataToGAS({ ...s, _action: 'SAVE_AS_NEW', customSheetName: timestamp });
+            }
+            alert(`[${timestamp}] 탭으로 새로운 데이터가 저장되었습니다.`);
+        } catch (error) {
+            console.error("Save as new failed:", error);
+            alert("저장에 실패했습니다.");
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    const handleBulkSave = async () => {
+        if (selectedSessionIds.size === 0) return;
+        const selectedSessions = sessions.filter(s => selectedSessionIds.has(s.id));
+        setIsSyncing(true);
+        try {
+            for (const s of selectedSessions) {
+                await sendDataToGAS({ ...s, _action: 'UPDATE' });
+            }
+            alert(`${selectedSessions.length}명의 데이터가 저장되었습니다.`);
+            setSelectedSessionIds(new Set());
+        } catch (error) {
+            console.error("Bulk save failed:", error);
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    const handleBulkDelete = () => {
+        if (selectedSessionIds.size === 0) return;
+        if (confirm(`${selectedSessionIds.size}명의 데이터를 리스트에서 삭제하시겠습니까?`)) {
+            setSessions(prev => prev.filter(s => !selectedSessionIds.has(s.id)));
+            setSelectedSessionIds(new Set());
+        }
+    };
+
+    const handleIndividualDelete = (e, id) => {
+        e.stopPropagation(); // Prevent opening detail panel
+        if (confirm("이 데이터를 리스트에서 삭제하시겠습니까?")) {
+            setSessions(prev => prev.filter(s => s.id !== id));
+            if (selectedSessionIds.has(id)) {
+                const newSet = new Set(selectedSessionIds);
+                newSet.delete(id);
+                setSelectedSessionIds(newSet);
+            }
         }
     };
 
@@ -235,7 +294,7 @@ export default function Dashboard() {
                 mode: 'no-cors', // Normal for GAS Web Apps
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    date: new Date().toISOString().split('T')[0],
+                    date: data.customSheetName || new Date().toISOString().split('T')[0],
                     timestamp: new Date().toISOString(),
                     ...data
                 })
@@ -371,6 +430,13 @@ export default function Dashboard() {
                         <p className="text-sm text-zinc-500 font-medium">{new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</p>
                     </div>
                     <div className="flex items-center gap-3">
+                        <button
+                            onClick={handleSaveAsNew}
+                            disabled={isSyncing || sessions.length === 0}
+                            className="h-9 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-zinc-800 text-white rounded-md text-sm font-bold shadow-lg shadow-emerald-500/10 transition-all flex items-center gap-2"
+                        >
+                            <Save size={14} /> NEW SAVE (TAB)
+                        </button>
                         <div className="relative">
                             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
                             <input placeholder="Search students..." className="h-9 w-64 bg-zinc-900/50 border border-zinc-800 rounded-md pl-9 pr-4 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-700 transition-all placeholder:text-zinc-600" />
@@ -392,7 +458,13 @@ export default function Dashboard() {
                                 <BulkGroup label="Voca" onUpdate={(val) => handleBulkUpdate('basic', 'voca', val)} />
                                 <BulkGroup label="Homework" onUpdate={(val) => handleBulkUpdate('homework', 'reading', val)} />
                                 <div className="flex items-center gap-2">
-                                    <button onClick={() => handleBulkUpdate('summaryConfirmed', null, true)} className="h-9 px-4 bg-indigo-600 rounded-lg text-sm font-bold shadow-lg shadow-indigo-500/20">Bulk Confirm</button>
+                                    <button onClick={() => handleBulkUpdate('summaryConfirmed', null, true)} className="h-9 px-4 bg-zinc-800 text-zinc-300 rounded-lg text-xs font-bold hover:bg-zinc-700 transition-colors">Bulk Confirm</button>
+                                    <button onClick={handleBulkSave} className="h-9 px-4 bg-indigo-600 rounded-lg text-xs font-bold shadow-lg shadow-indigo-500/20 hover:bg-indigo-500 transition-colors flex items-center gap-2">
+                                        <Save size={12} /> Bulk Save
+                                    </button>
+                                    <button onClick={handleBulkDelete} className="h-9 px-4 bg-red-600/20 text-red-500 border border-red-500/20 rounded-lg text-xs font-bold hover:bg-red-600 hover:text-white transition-all flex items-center gap-2">
+                                        <X size={12} /> Bulk Delete
+                                    </button>
                                 </div>
                             </div>
 
@@ -434,7 +506,15 @@ export default function Dashboard() {
                                     {s.backlogCount > 5 && <div className="ml-2 flex items-center text-red-500 text-[10px] font-black gap-0.5 animate-pulse"><AlertTriangle size={12} /> {s.backlogCount}</div>}
                                 </div>
                                 <div className="text-sm text-zinc-500 font-medium">{s.lastEditedBy}</div>
-                                <div className="text-zinc-700 group-hover:text-zinc-400 transition-colors"><ChevronRight size={20} /></div>
+                                <div className="text-zinc-700 group-hover:text-zinc-400 transition-colors flex items-center gap-3">
+                                    <button
+                                        onClick={(e) => handleIndividualDelete(e, s.id)}
+                                        className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-lg transition-all opacity-0 group-hover:opacity-100"
+                                    >
+                                        <X size={16} />
+                                    </button>
+                                    <ChevronRight size={20} />
+                                </div>
                             </div>
                         ))}
                     </div>
