@@ -94,7 +94,8 @@ export default function Dashboard() {
     const [isSyncing, setIsSyncing] = useState(false);
     const [inputMode, setInputMode] = useState('single');
 
-    const GAS_URL = "https://script.google.com/macros/s/AKfycbxjYvFop2Ac82gD3z8Md2t1fohe9qI5xMNLuWjGmwk8u7KGMfIz1ZfAycF76vH1zg5R/exec";
+    const BASIC_DATA_URL = "https://script.google.com/macros/s/AKfycbziZbpq-HW8coDgVVRsvKMvTuTl4ttvXTpNXLmXXKOSHPe8tYfdVOYI-hBI2F-sYgkr/exec";
+    const FLOW_DATA_URL = "https://script.google.com/macros/s/AKfycbwkcz9_P-WRIhHFeelZaMaJO1v5R7U4-HrWfLrJCRGavQnlDIJU5XPF7ZfOivzM9z26BA/exec";
 
     const currentSession = useMemo(() => sessions.find(s => s.id === currentSessionId), [sessions, currentSessionId]);
 
@@ -120,7 +121,7 @@ export default function Dashboard() {
         try {
             setSessions(prev => [...newSessions, ...prev]);
             for (const s of newSessions) {
-                await sendDataToGAS({ ...s, _action: 'CREATE' });
+                await sendDataToGAS(s, BASIC_DATA_URL);
             }
             alert(`${newSessions.length}개의 세션이 추가되었습니다.`);
         } catch (error) {
@@ -144,7 +145,7 @@ export default function Dashboard() {
 
             // Send all sessions with a special 'SAVE_AS_NEW' action and custom tab name
             for (const s of sessions) {
-                await sendDataToGAS({ ...s, _action: 'SAVE_AS_NEW', customSheetName: timestamp });
+                await sendDataToGAS({ ...s, _action: 'SAVE_AS_NEW', customSheetName: timestamp }, BASIC_DATA_URL);
             }
             alert(`[${timestamp}] 탭으로 새로운 데이터가 저장되었습니다.`);
         } catch (error) {
@@ -161,7 +162,7 @@ export default function Dashboard() {
         setIsSyncing(true);
         try {
             for (const s of selectedSessions) {
-                await sendDataToGAS({ ...s, _action: 'UPDATE' });
+                await sendDataToGAS(s, FLOW_DATA_URL);
             }
             alert(`${selectedSessions.length}명의 데이터가 저장되었습니다.`);
             setSelectedSessionIds(new Set());
@@ -172,22 +173,44 @@ export default function Dashboard() {
         }
     };
 
-    const handleBulkDelete = () => {
+    const handleBulkDelete = async () => {
         if (selectedSessionIds.size === 0) return;
         if (confirm(`${selectedSessionIds.size}명의 데이터를 리스트에서 삭제하시겠습니까?`)) {
-            setSessions(prev => prev.filter(s => !selectedSessionIds.has(s.id)));
-            setSelectedSessionIds(new Set());
+            const selectedSessions = sessions.filter(s => selectedSessionIds.has(s.id));
+            setIsSyncing(true);
+            try {
+                for (const s of selectedSessions) {
+                    await sendDataToGAS({ ...s, _action: 'DELETE' }, BASIC_DATA_URL);
+                }
+                setSessions(prev => prev.filter(s => !selectedSessionIds.has(s.id)));
+                setSelectedSessionIds(new Set());
+            } catch (error) {
+                console.error("Delete failed:", error);
+            } finally {
+                setIsSyncing(false);
+            }
         }
     };
 
-    const handleIndividualDelete = (e, id) => {
-        e.stopPropagation(); // Prevent opening detail panel
+    const handleIndividualDelete = async (e, id) => {
+        e.stopPropagation();
         if (confirm("이 데이터를 리스트에서 삭제하시겠습니까?")) {
-            setSessions(prev => prev.filter(s => s.id !== id));
-            if (selectedSessionIds.has(id)) {
-                const newSet = new Set(selectedSessionIds);
-                newSet.delete(id);
-                setSelectedSessionIds(newSet);
+            const sessionToDelete = sessions.find(s => s.id === id);
+            setIsSyncing(true);
+            try {
+                if (sessionToDelete) {
+                    await sendDataToGAS({ ...sessionToDelete, _action: 'DELETE' }, BASIC_DATA_URL);
+                }
+                setSessions(prev => prev.filter(s => s.id !== id));
+                if (selectedSessionIds.has(id)) {
+                    const newSet = new Set(selectedSessionIds);
+                    newSet.delete(id);
+                    setSelectedSessionIds(newSet);
+                }
+            } catch (error) {
+                console.error("Delete failed:", error);
+            } finally {
+                setIsSyncing(false);
             }
         }
     };
@@ -286,12 +309,37 @@ export default function Dashboard() {
         return session.checks.summaryConfirmed;
     };
 
-    const sendDataToGAS = async (data, retryCount = 0) => {
+    const handleCheckout = async (session) => {
+        if (!canCheckout(session)) {
+            alert("Confirm Summary 버튼을 먼저 누르고, 누락된 항목(체크리스트 x, ▲ 등)이 없는지 확인해주세요.");
+            return;
+        }
+
         setIsSyncing(true);
         try {
-            const response = await fetch(GAS_URL, {
+            const updatedSession = JSON.parse(JSON.stringify(session));
+            updatedSession.status = 'checked-out';
+            updatedSession.checks.summaryConfirmed = true;
+
+            await sendDataToGAS(updatedSession, FLOW_DATA_URL);
+
+            setSessions(prev => prev.map(s => s.id === session.id ? updatedSession : s));
+            alert("발송 및 퇴실 처리가 완료되었습니다!");
+            setShowDetailPanel(false);
+        } catch (error) {
+            console.error("Checkout failed:", error);
+            alert("퇴실 처리에 실패했습니다.");
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    const sendDataToGAS = async (data, targetUrl, retryCount = 0) => {
+        setIsSyncing(true);
+        try {
+            const response = await fetch(targetUrl, {
                 method: 'POST',
-                mode: 'no-cors', // Normal for GAS Web Apps
+                mode: 'no-cors',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     date: data.customSheetName || new Date().toISOString().split('T')[0],
@@ -299,34 +347,20 @@ export default function Dashboard() {
                     ...data
                 })
             });
-            console.log("Data sent to GAS successfully");
             return true;
         } catch (error) {
             console.error(`Sync failed (Attempt ${retryCount + 1}):`, error);
-            if (retryCount < 5) {
+            if (retryCount < 3) {
                 const delay = Math.pow(2, retryCount) * 1000;
                 await new Promise(resolve => setTimeout(resolve, delay));
-                return sendDataToGAS(data, retryCount + 1);
+                return sendDataToGAS(data, targetUrl, retryCount + 1);
             }
-            alert("서버 연결에 실패했습니다. 네트워크 상태를 확인해주세요.");
             return false;
         } finally {
             setIsSyncing(false);
         }
     };
 
-    const handleCheckout = async (session) => {
-        if (!canCheckout(session)) {
-            alert("진행 중인 학습에 'X' 또는 '△'가 남아있거나, 최종 확인이 완료되지 않았습니다.");
-            return;
-        }
-
-        const success = await sendDataToGAS(session);
-        if (success) {
-            alert(`${session.name} 학생의 귀가가 승인되었습니다. 구글 시트 저장이 완료되었습니다.`);
-            setShowDetailPanel(false);
-        }
-    };
 
     const copyToClipboard = (text) => {
         navigator.clipboard.writeText(text);
