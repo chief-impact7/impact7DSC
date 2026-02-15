@@ -94,7 +94,7 @@ export default function Dashboard() {
     const [isSyncing, setIsSyncing] = useState(false);
     const [inputMode, setInputMode] = useState('single');
 
-    const GAS_URL = "https://script.google.com/macros/s/AKfycbzup4-XNufGlQ2m-u9RTfUBsTrwz9FBhZCjNwpjNV--dt4jGdjfEbZ-hiFcKoLq69MhDA/exec";
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbxjYvFop2Ac82gD3z8Md2t1fohe9qI5xMNLuWjGmwk8u7KGMfIz1ZfAycF76vH1zg5R/exec";
 
     const currentSession = useMemo(() => sessions.find(s => s.id === currentSessionId), [sessions, currentSessionId]);
 
