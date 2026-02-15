@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import {
     Users, CheckSquare, MessageSquare, Save, Search, Filter,
     MoreHorizontal, ChevronRight, Check, X, AlertTriangle,
-    ChevronDown, Copy, Send, LogOut, Clock, Calendar
+    ChevronDown, Copy, Send, LogOut, Clock, Calendar, Plus, UserPlus, Layers, Loader2
 } from 'lucide-react';
 
 // Mock Data based on gemini.md
@@ -92,6 +92,7 @@ export default function Dashboard() {
     const [showDetailPanel, setShowDetailPanel] = useState(false);
     const [currentSessionId, setCurrentSessionId] = useState(null);
     const [isSyncing, setIsSyncing] = useState(false);
+    const [showCreateModal, setShowCreateModal] = useState(false);
 
     const GAS_URL = "https://script.google.com/macros/s/AKfycbzup4-XNufGlQ2m-u9RTfUBsTrwz9FBhZCjNwpjNV--dt4jGdjfEbZ-hiFcKoLq69MhDA/exec";
 
@@ -112,6 +113,25 @@ export default function Dashboard() {
     const openDetail = (id) => {
         setCurrentSessionId(id);
         setShowDetailPanel(true);
+    };
+
+    const handleCreateSessions = async (newSessions) => {
+        setIsSyncing(true);
+        try {
+            // Add to local state first for instant feedback (optimistic)
+            setSessions(prev => [...newSessions, ...prev]);
+
+            // Sync each to GAS (sequential for reliability, or Promise.all)
+            for (const s of newSessions) {
+                await sendDataToGAS({ ...s, _action: 'CREATE' });
+            }
+            setShowCreateModal(false);
+            alert(`${newSessions.length}개의 세션이 추가되었습니다.`);
+        } catch (error) {
+            console.error("Session creation failed:", error);
+        } finally {
+            setIsSyncing(false);
+        }
     };
 
     /**
@@ -299,6 +319,9 @@ export default function Dashboard() {
                             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
                             <input placeholder="Search students..." className="h-9 w-64 bg-zinc-900/50 border border-zinc-800 rounded-md pl-9 pr-4 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-700 transition-all placeholder:text-zinc-600" />
                         </div>
+                        <button onClick={() => setShowCreateModal(true)} className="h-9 px-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-sm font-bold shadow-lg shadow-indigo-500/20 transition-all flex items-center gap-2">
+                            <Plus size={16} strokeWidth={3} /> Add Session
+                        </button>
                         <button className="h-9 px-3 bg-zinc-900 border border-zinc-800 rounded-md text-sm font-medium text-zinc-400 hover:text-white transition-colors flex items-center gap-2"><Filter size={14} /> Filter</button>
                     </div>
                 </header>
@@ -476,6 +499,14 @@ export default function Dashboard() {
                     </div>
                 </>
             )}
+            {/* Create Session Modal */}
+            {showCreateModal && (
+                <CreateSessionModal
+                    onClose={() => setShowCreateModal(false)}
+                    onSubmit={handleCreateSessions}
+                    isSyncing={isSyncing}
+                />
+            )}
         </div>
     );
 }
@@ -542,6 +573,153 @@ function BulkGroup({ label, onUpdate }) {
                 <button onClick={() => onUpdate('o')} className="w-8 h-8 rounded-lg bg-green-500/10 text-green-500 border border-green-500/20 flex items-center justify-center hover:bg-green-500/20 transition-all"><Check size={14} /></button>
                 <button onClick={() => onUpdate('triangle')} className="w-8 h-8 rounded-lg bg-yellow-500/10 text-yellow-500 border border-yellow-500/20 flex items-center justify-center hover:bg-yellow-500/20 transition-all font-bold text-[10px]">▲</button>
                 <button onClick={() => onUpdate('x')} className="w-8 h-8 rounded-lg bg-red-500/10 text-red-500 border border-red-500/20 flex items-center justify-center hover:bg-red-500/20 transition-all"><X size={14} /></button>
+            </div>
+        </div>
+    );
+}
+
+const createBlankSession = (name, className, time, type) => ({
+    id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
+    studentId: "st_" + Math.random().toString(36).substring(2, 7),
+    name: name.trim(),
+    class: className,
+    time,
+    type,
+    status: "waiting",
+    backlogCount: 0,
+    lastEditedBy: "Teacher Kim",
+    checks: {
+        basic: { voca: "none", idiom: "none", step3: "none", isc: "none" },
+        homework: { reading: "none", grammar: "none", practice: "none", listening: "none", etc: "none" },
+        review: { reading: "none", grammar: "none", practice: "none", listening: "none" },
+        nextHomework: { reading: "", grammar: "", practice: "", listening: "", extra: "" },
+        memos: { toDesk: "", fromDesk: "", toParent: "" },
+        homeworkResult: "none",
+        summaryConfirmed: false
+    }
+});
+
+function CreateSessionModal({ onClose, onSubmit, isSyncing }) {
+    const [mode, setMode] = useState('single');
+    const [formData, setFormData] = useState({
+        name: '',
+        names: '',
+        class: 'Middle-A',
+        time: '15:00',
+        type: 'Regular Class'
+    });
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        const sessions = [];
+        if (mode === 'single') {
+            if (!formData.name.trim()) return;
+            sessions.push(createBlankSession(formData.name, formData.class, formData.time, formData.type));
+        } else {
+            const nameList = formData.names.split(/[,\n]/).filter(n => n.trim() !== "");
+            if (nameList.length === 0) return;
+            nameList.forEach(n => {
+                sessions.push(createBlankSession(n, formData.class, formData.time, formData.type));
+            });
+        }
+        onSubmit(sessions);
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[100] flex items-center justify-center p-4 animate-in fade-in duration-300">
+            <div className="bg-[#18181b] border border-zinc-800 w-full max-w-[500px] rounded-2xl shadow-2xl overflow-hidden flex flex-col animate-in zoom-in-95 duration-300">
+                <header className="p-6 border-b border-zinc-800 flex items-center justify-between">
+                    <div>
+                        <h2 className="text-xl font-bold tracking-tight">Create Sessions</h2>
+                        <p className="text-xs text-zinc-500 font-medium">Add students to today's list</p>
+                    </div>
+                    <button onClick={onClose} className="p-2 hover:bg-zinc-800 rounded-lg text-zinc-500 transition-colors"><X size={20} /></button>
+                </header>
+
+                <div className="p-2 bg-zinc-900/50 flex gap-1">
+                    <button
+                        type="button"
+                        onClick={() => setMode('single')}
+                        className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 ${mode === 'single' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
+                    >
+                        <UserPlus size={14} /> Single Student
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setMode('bulk')}
+                        className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 ${mode === 'bulk' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
+                    >
+                        <Layers size={14} /> Bulk Entry
+                    </button>
+                </div>
+
+                <form onSubmit={handleSubmit} className="p-8 space-y-6">
+                    {mode === 'single' ? (
+                        <div>
+                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Student Name</label>
+                            <input
+                                required
+                                value={formData.name}
+                                onChange={e => setFormData({ ...formData, name: e.target.value })}
+                                placeholder="Enter full name"
+                                className="w-full bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 transition-all font-medium text-white"
+                            />
+                        </div>
+                    ) : (
+                        <div>
+                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Student Names (Comma or Newline separated)</label>
+                            <textarea
+                                required
+                                value={formData.names}
+                                onChange={e => setFormData({ ...formData, names: e.target.value })}
+                                placeholder="Kim, Lee, Park..."
+                                className="w-full bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 transition-all h-32 resize-none font-medium text-white"
+                            />
+                        </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-4">
+                        <div>
+                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Class</label>
+                            <select
+                                value={formData.class}
+                                onChange={e => setFormData({ ...formData, class: e.target.value })}
+                                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 appearance-none font-medium text-white"
+                            >
+                                <option>Middle-A</option>
+                                <option>Middle-B</option>
+                                <option>High-A</option>
+                                <option>High-B</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Time</label>
+                            <input
+                                type="time"
+                                value={formData.time}
+                                onChange={e => setFormData({ ...formData, time: e.target.value })}
+                                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium text-white"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="pt-4 flex gap-3">
+                        <button
+                            type="button"
+                            onClick={onClose}
+                            className="flex-1 h-12 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-400 font-bold rounded-xl transition-all"
+                        >
+                            Cancel
+                        </button>
+                        <button
+                            disabled={isSyncing}
+                            className="flex-[2] h-12 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold transition-all shadow-lg shadow-indigo-500/20 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            {isSyncing ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />}
+                            {isSyncing ? 'Synchronizing...' : 'Create Sessions'}
+                        </button>
+                    </div>
+                </form>
             </div>
         </div>
     );
