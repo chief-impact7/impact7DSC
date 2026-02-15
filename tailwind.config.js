@@ -8,25 +8,25 @@ export default {
   theme: {
     extend: {
       colors: {
-        background: '#09090b', // Zinc 950
-        foreground: '#fafafa', // Zinc 50
-        card: '#18181b', // Zinc 900
-        'card-foreground': '#fafafa', // Zinc 50
-        popover: '#18181b', // Zinc 900
-        'popover-foreground': '#fafafa', // Zinc 50
-        primary: '#fafafa', // Zinc 50
-        'primary-foreground': '#18181b', // Zinc 900
-        secondary: '#27272a', // Zinc 800
-        'secondary-foreground': '#fafafa', // Zinc 50
-        muted: '#27272a', // Zinc 800
-        'muted-foreground': '#a1a1aa', // Zinc 400
-        accent: '#27272a', // Zinc 800
-        'accent-foreground': '#fafafa', // Zinc 50
-        destructive: '#7f1d1d', // Red 900
-        'destructive-foreground': '#fafafa', // Zinc 50
-        border: '#27272a', // Zinc 800
-        input: '#27272a', // Zinc 800
-        ring: '#d4d4d8', // Zinc 300
+        background: '#FBFBFA', // Attio-style soft background
+        foreground: '#111110', // Deep black text
+        card: '#FFFFFF',
+        'card-foreground': '#111110',
+        popover: '#FFFFFF',
+        'popover-foreground': '#111110',
+        primary: '#000000', // Black as primary accent
+        'primary-foreground': '#FFFFFF',
+        secondary: '#F5F5F4',
+        'secondary-foreground': '#666665',
+        muted: '#F5F5F4',
+        'muted-foreground': '#666665',
+        accent: '#F5F5F4',
+        'accent-foreground': '#111110',
+        destructive: '#F97066',
+        'destructive-foreground': '#FFFFFF',
+        border: '#EBEBEA', // Subtle border color
+        input: '#FFFFFF',
+        ring: '#000000',
       },
     },
   },
