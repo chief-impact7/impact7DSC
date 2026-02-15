@@ -11,7 +11,10 @@ const INITIAL_SESSIONS = [
         id: "101",
         studentId: "st_001",
         name: "김철수 (Student A)",
-        class: "Middle-A",
+        classes: ["Middle-A"],
+        schoolName: "Impact MS",
+        grade: "M1",
+        attendanceDays: ["Mon", "Wed", "Sun"],
         time: "15:00",
         type: "Regular Class",
         status: "attendance",
@@ -31,7 +34,10 @@ const INITIAL_SESSIONS = [
         id: "102",
         studentId: "st_002",
         name: "이영희 (Student B)",
-        class: "High-B",
+        classes: ["High-B"],
+        schoolName: "Impact HS",
+        grade: "H2",
+        attendanceDays: ["Tue", "Thu", "Sun"],
         time: "15:00",
         type: "Test",
         status: "late",
@@ -40,26 +46,6 @@ const INITIAL_SESSIONS = [
         checks: {
             basic: { voca: "none", idiom: "none", step3: "none", isc: "none" },
             homework: { reading: "triangle", grammar: "none", practice: "none", listening: "none", etc: "none" },
-            review: { reading: "none", grammar: "none", practice: "none", listening: "none" },
-            nextHomework: { reading: "", grammar: "", practice: "", listening: "", extra: "" },
-            memos: { toDesk: "", fromDesk: "", toParent: "" },
-            homeworkResult: "none",
-            summaryConfirmed: false
-        }
-    },
-    {
-        id: "103",
-        studentId: "st_003",
-        name: "박민수 (Student C)",
-        class: "Elementary-C",
-        time: "16:30",
-        type: "Clinic",
-        status: "absent",
-        backlogCount: 0,
-        lastEditedBy: "Teacher Lee",
-        checks: {
-            basic: { voca: "none", idiom: "none", step3: "none", isc: "none" },
-            homework: { reading: "none", grammar: "none", practice: "none", listening: "none", etc: "none" },
             review: { reading: "none", grammar: "none", practice: "none", listening: "none" },
             nextHomework: { reading: "", grammar: "", practice: "", listening: "", extra: "" },
             memos: { toDesk: "", fromDesk: "", toParent: "" },
@@ -89,6 +75,7 @@ const CheckStatusIcon = ({ status, size = 16 }) => {
 export default function Dashboard() {
     const [sessions, setSessions] = useState(INITIAL_SESSIONS);
     const [selectedSessionIds, setSelectedSessionIds] = useState(new Set());
+    const [showDetailPanel, setShowDetailPanel] = useState(false);
     const [currentSessionId, setCurrentSessionId] = useState(null);
     const [isSyncing, setIsSyncing] = useState(false);
     const [inputMode, setInputMode] = useState('single');
@@ -112,7 +99,7 @@ export default function Dashboard() {
             const matchesGrade = filters.grade === 'All' || s.grade === filters.grade;
 
             if (viewMode === 'today') {
-                const isScheduledToday = s.attendanceDays && s.attendanceDays.includes(todayName);
+                const isScheduledToday = (!s.attendanceDays || s.attendanceDays.length === 0) || s.attendanceDays.includes(todayName);
                 return matchesSearch && matchesClass && matchesSchool && matchesGrade && isScheduledToday;
             }
             return matchesSearch && matchesClass && matchesSchool && matchesGrade;
@@ -620,6 +607,16 @@ export default function Dashboard() {
                             <div>Last Edit</div>
                             <div></div>
                         </div>
+
+                        {filteredSessions.length === 0 && (
+                            <div className="flex flex-col items-center justify-center py-20 bg-zinc-900/20 rounded-3xl border border-zinc-800/50 border-dashed">
+                                <div className="w-16 h-16 rounded-2xl bg-zinc-900 flex items-center justify-center mb-4">
+                                    <Users className="text-zinc-700" size={32} />
+                                </div>
+                                <h3 className="text-zinc-400 font-bold mb-1">No students found</h3>
+                                <p className="text-zinc-600 text-xs">Try changing filters or adding new students.</p>
+                            </div>
+                        )}
 
                         {filteredSessions.map(s => (
                             <div key={s.id}
