@@ -92,7 +92,7 @@ export default function Dashboard() {
     const [showDetailPanel, setShowDetailPanel] = useState(false);
     const [currentSessionId, setCurrentSessionId] = useState(null);
     const [isSyncing, setIsSyncing] = useState(false);
-    const [showCreateModal, setShowCreateModal] = useState(false);
+    const [inputMode, setInputMode] = useState('single');
 
     const GAS_URL = "https://script.google.com/macros/s/AKfycbzup4-XNufGlQ2m-u9RTfUBsTrwz9FBhZCjNwpjNV--dt4jGdjfEbZ-hiFcKoLq69MhDA/exec";
 
@@ -121,11 +121,10 @@ export default function Dashboard() {
             // Add to local state first for instant feedback (optimistic)
             setSessions(prev => [...newSessions, ...prev]);
 
-            // Sync each to GAS (sequential for reliability, or Promise.all)
+            // Sync each to GAS
             for (const s of newSessions) {
                 await sendDataToGAS({ ...s, _action: 'CREATE' });
             }
-            setShowCreateModal(false);
             alert(`${newSessions.length}개의 세션이 추가되었습니다.`);
         } catch (error) {
             console.error("Session creation failed:", error);
@@ -287,12 +286,69 @@ export default function Dashboard() {
                     </div>
                 </div>
 
-                <nav className="flex-1 px-3 space-y-1">
+                <nav className="px-3 space-y-1 py-4">
                     <NavItem icon={<Clock size={16} />} label="Timeline" active />
                     <NavItem icon={<AlertTriangle size={16} />} label="Backlog" badge="8" />
                     <NavItem icon={<Users size={16} />} label="Students" />
                     <NavItem icon={<Calendar size={16} />} label="History" />
                 </nav>
+
+                <div className="flex-1 overflow-y-auto px-4 py-2 border-t border-zinc-900 space-y-6 scrollbar-hide">
+                    <div className="pt-2">
+                        <p className="text-[10px] font-black text-zinc-600 uppercase tracking-widest px-2 mb-4 flex items-center justify-between">
+                            Add Session
+                            {isSyncing && <Loader2 size={12} className="animate-spin text-indigo-500" />}
+                        </p>
+
+                        <div className="flex bg-zinc-900 p-1 rounded-lg mb-4">
+                            <button onClick={() => setInputMode('single')} className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all ${inputMode === 'single' ? 'bg-zinc-800 text-white' : 'text-zinc-500 hover:text-zinc-400'}`}>Single</button>
+                            <button onClick={() => setInputMode('bulk')} className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all ${inputMode === 'bulk' ? 'bg-zinc-800 text-white' : 'text-zinc-500 hover:text-zinc-400'}`}>Excel Bulk</button>
+                        </div>
+
+                        {inputMode === 'single' ? (
+                            <form
+                                onSubmit={(e) => {
+                                    e.preventDefault();
+                                    const formData = new FormData(e.target);
+                                    handleCreateSessions([createBlankSession({
+                                        name: formData.get('name'),
+                                        class: formData.get('class'),
+                                        time: formData.get('time')
+                                    })]);
+                                    e.target.reset();
+                                }}
+                                className="space-y-3"
+                            >
+                                <SidebarInput name="name" placeholder="학생명" />
+                                <SidebarInput name="class" placeholder="반명" />
+                                <SidebarInput name="time" type="time" defaultValue="15:00" />
+                                <button disabled={isSyncing} className="w-full h-10 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold transition-all shadow-lg shadow-indigo-500/10 disabled:opacity-50">Create</button>
+                            </form>
+                        ) : (
+                            <div className="space-y-3">
+                                <textarea
+                                    placeholder="학생명	부모HP	학생HP	반명	상담일	학교명	학년 (엑셀에서 복사하여 붙여넣으세요)"
+                                    className="w-full h-32 bg-zinc-900/50 border border-zinc-800 rounded-lg p-3 text-xs text-zinc-300 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none font-medium placeholder:text-zinc-700"
+                                    onPaste={(e) => {
+                                        const text = e.clipboardData.getData('text');
+                                        if (!text) return;
+                                        const lines = text.trim().split('\n');
+                                        const newSessions = lines.map(line => {
+                                            const [name, pHP, sHP, className, consDate, school, grade] = line.split('\t');
+                                            if (!name) return null;
+                                            return createBlankSession({
+                                                name, parentPhone: pHP, studentPhone: sHP, class: className,
+                                                consultDate: consDate, schoolName: school, grade
+                                            });
+                                        }).filter(Boolean);
+                                        if (newSessions.length > 0) handleCreateSessions(newSessions);
+                                    }}
+                                />
+                                <p className="text-[9px] text-zinc-600 text-center">Paste from Excel to import multiple</p>
+                            </div>
+                        )}
+                    </div>
+                </div>
 
                 <div className="p-4 border-t border-border">
                     <div className="flex items-center gap-3 p-2 rounded-lg hover:bg-zinc-900 cursor-pointer transition-colors">
@@ -319,9 +375,6 @@ export default function Dashboard() {
                             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
                             <input placeholder="Search students..." className="h-9 w-64 bg-zinc-900/50 border border-zinc-800 rounded-md pl-9 pr-4 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-700 transition-all placeholder:text-zinc-600" />
                         </div>
-                        <button onClick={() => setShowCreateModal(true)} className="h-9 px-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-sm font-bold shadow-lg shadow-indigo-500/20 transition-all flex items-center gap-2">
-                            <Plus size={16} strokeWidth={3} /> Add Session
-                        </button>
                         <button className="h-9 px-3 bg-zinc-900 border border-zinc-800 rounded-md text-sm font-medium text-zinc-400 hover:text-white transition-colors flex items-center gap-2"><Filter size={14} /> Filter</button>
                     </div>
                 </header>
@@ -499,15 +552,16 @@ export default function Dashboard() {
                     </div>
                 </>
             )}
-            {/* Create Session Modal */}
-            {showCreateModal && (
-                <CreateSessionModal
-                    onClose={() => setShowCreateModal(false)}
-                    onSubmit={handleCreateSessions}
-                    isSyncing={isSyncing}
-                />
-            )}
         </div>
+    );
+}
+
+function SidebarInput({ ...props }) {
+    return (
+        <input
+            {...props}
+            className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 transition-all font-medium placeholder:text-zinc-700"
+        />
     );
 }
 
@@ -578,13 +632,18 @@ function BulkGroup({ label, onUpdate }) {
     );
 }
 
-const createBlankSession = (name, className, time, type) => ({
+const createBlankSession = (data) => ({
     id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
     studentId: "st_" + Math.random().toString(36).substring(2, 7),
-    name: name.trim(),
-    class: className,
-    time,
-    type,
+    name: (data.name || "Unknown").trim(),
+    parentPhone: data.parentPhone || "",
+    studentPhone: data.studentPhone || "",
+    class: data.class || "Unassigned",
+    consultDate: data.consultDate || "",
+    schoolName: data.schoolName || "",
+    grade: data.grade || "",
+    time: data.time || "15:00",
+    type: data.type || "Regular",
     status: "waiting",
     backlogCount: 0,
     lastEditedBy: "Teacher Kim",
@@ -599,128 +658,3 @@ const createBlankSession = (name, className, time, type) => ({
     }
 });
 
-function CreateSessionModal({ onClose, onSubmit, isSyncing }) {
-    const [mode, setMode] = useState('single');
-    const [formData, setFormData] = useState({
-        name: '',
-        names: '',
-        class: 'Middle-A',
-        time: '15:00',
-        type: 'Regular Class'
-    });
-
-    const handleSubmit = (e) => {
-        e.preventDefault();
-        const sessions = [];
-        if (mode === 'single') {
-            if (!formData.name.trim()) return;
-            sessions.push(createBlankSession(formData.name, formData.class, formData.time, formData.type));
-        } else {
-            const nameList = formData.names.split(/[,\n]/).filter(n => n.trim() !== "");
-            if (nameList.length === 0) return;
-            nameList.forEach(n => {
-                sessions.push(createBlankSession(n, formData.class, formData.time, formData.type));
-            });
-        }
-        onSubmit(sessions);
-    };
-
-    return (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[100] flex items-center justify-center p-4 animate-in fade-in duration-300">
-            <div className="bg-[#18181b] border border-zinc-800 w-full max-w-[500px] rounded-2xl shadow-2xl overflow-hidden flex flex-col animate-in zoom-in-95 duration-300">
-                <header className="p-6 border-b border-zinc-800 flex items-center justify-between">
-                    <div>
-                        <h2 className="text-xl font-bold tracking-tight">Create Sessions</h2>
-                        <p className="text-xs text-zinc-500 font-medium">Add students to today's list</p>
-                    </div>
-                    <button onClick={onClose} className="p-2 hover:bg-zinc-800 rounded-lg text-zinc-500 transition-colors"><X size={20} /></button>
-                </header>
-
-                <div className="p-2 bg-zinc-900/50 flex gap-1">
-                    <button
-                        type="button"
-                        onClick={() => setMode('single')}
-                        className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 ${mode === 'single' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
-                    >
-                        <UserPlus size={14} /> Single Student
-                    </button>
-                    <button
-                        type="button"
-                        onClick={() => setMode('bulk')}
-                        className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 ${mode === 'bulk' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
-                    >
-                        <Layers size={14} /> Bulk Entry
-                    </button>
-                </div>
-
-                <form onSubmit={handleSubmit} className="p-8 space-y-6">
-                    {mode === 'single' ? (
-                        <div>
-                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Student Name</label>
-                            <input
-                                required
-                                value={formData.name}
-                                onChange={e => setFormData({ ...formData, name: e.target.value })}
-                                placeholder="Enter full name"
-                                className="w-full bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 transition-all font-medium text-white"
-                            />
-                        </div>
-                    ) : (
-                        <div>
-                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Student Names (Comma or Newline separated)</label>
-                            <textarea
-                                required
-                                value={formData.names}
-                                onChange={e => setFormData({ ...formData, names: e.target.value })}
-                                placeholder="Kim, Lee, Park..."
-                                className="w-full bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 transition-all h-32 resize-none font-medium text-white"
-                            />
-                        </div>
-                    )}
-
-                    <div className="grid grid-cols-2 gap-4">
-                        <div>
-                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Class</label>
-                            <select
-                                value={formData.class}
-                                onChange={e => setFormData({ ...formData, class: e.target.value })}
-                                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 appearance-none font-medium text-white"
-                            >
-                                <option>Middle-A</option>
-                                <option>Middle-B</option>
-                                <option>High-A</option>
-                                <option>High-B</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mb-2 block">Time</label>
-                            <input
-                                type="time"
-                                value={formData.time}
-                                onChange={e => setFormData({ ...formData, time: e.target.value })}
-                                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium text-white"
-                            />
-                        </div>
-                    </div>
-
-                    <div className="pt-4 flex gap-3">
-                        <button
-                            type="button"
-                            onClick={onClose}
-                            className="flex-1 h-12 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-400 font-bold rounded-xl transition-all"
-                        >
-                            Cancel
-                        </button>
-                        <button
-                            disabled={isSyncing}
-                            className="flex-[2] h-12 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold transition-all shadow-lg shadow-indigo-500/20 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {isSyncing ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />}
-                            {isSyncing ? 'Synchronizing...' : 'Create Sessions'}
-                        </button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    );
-}
