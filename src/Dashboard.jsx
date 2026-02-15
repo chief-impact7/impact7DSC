@@ -89,15 +89,51 @@ const CheckStatusIcon = ({ status, size = 16 }) => {
 export default function Dashboard() {
     const [sessions, setSessions] = useState(INITIAL_SESSIONS);
     const [selectedSessionIds, setSelectedSessionIds] = useState(new Set());
-    const [showDetailPanel, setShowDetailPanel] = useState(false);
     const [currentSessionId, setCurrentSessionId] = useState(null);
     const [isSyncing, setIsSyncing] = useState(false);
     const [inputMode, setInputMode] = useState('single');
+    const [viewMode, setViewMode] = useState('today'); // 'today' or 'master'
+    const [searchQuery, setSearchQuery] = useState('');
+    const [filters, setFilters] = useState({ class: 'All', school: 'All', grade: 'All' });
 
     const BASIC_DATA_URL = "https://script.google.com/macros/s/AKfycbziZbpq-HW8coDgVVRsvKMvTuTl4ttvXTpNXLmXXKOSHPe8tYfdVOYI-hBI2F-sYgkr/exec";
     const FLOW_DATA_URL = "https://script.google.com/macros/s/AKfycbwkcz9_P-WRIhHFeelZaMaJO1v5R7U4-HrWfLrJCRGavQnlDIJU5XPF7ZfOivzM9z26BA/exec";
 
     const currentSession = useMemo(() => sessions.find(s => s.id === currentSessionId), [sessions, currentSessionId]);
+
+    const weekDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const todayName = new Date().toLocaleDateString('en-US', { weekday: 'short' });
+
+    const filteredSessions = useMemo(() => {
+        return sessions.filter(s => {
+            const matchesSearch = s.name.includes(searchQuery) || (s.studentId && s.studentId.includes(searchQuery));
+            const matchesClass = filters.class === 'All' || (s.classes && s.classes.includes(filters.class));
+            const matchesSchool = filters.school === 'All' || s.schoolName === filters.school;
+            const matchesGrade = filters.grade === 'All' || s.grade === filters.grade;
+
+            if (viewMode === 'today') {
+                const isScheduledToday = s.attendanceDays && s.attendanceDays.includes(todayName);
+                return matchesSearch && matchesClass && matchesSchool && matchesGrade && isScheduledToday;
+            }
+            return matchesSearch && matchesClass && matchesSchool && matchesGrade;
+        });
+    }, [sessions, searchQuery, filters, viewMode, todayName]);
+
+    const filterOptions = useMemo(() => {
+        const classes = new Set();
+        const schools = new Set();
+        const grades = new Set();
+        sessions.forEach(s => {
+            if (s.classes) s.classes.forEach(c => classes.add(c));
+            if (s.schoolName) schools.add(s.schoolName);
+            if (s.grade) grades.add(s.grade);
+        });
+        return {
+            classes: ['All', ...Array.from(classes).sort()],
+            schools: ['All', ...Array.from(schools).sort()],
+            grades: ['All', ...Array.from(grades).sort()]
+        };
+    }, [sessions]);
 
     const toggleSelection = (id) => {
         const newSet = new Set(selectedSessionIds);
@@ -107,8 +143,8 @@ export default function Dashboard() {
     };
 
     const selectAll = () => {
-        if (selectedSessionIds.size === sessions.length) setSelectedSessionIds(new Set());
-        else setSelectedSessionIds(new Set(sessions.map(s => s.id)));
+        if (selectedSessionIds.size === filteredSessions.length) setSelectedSessionIds(new Set());
+        else setSelectedSessionIds(new Set(filteredSessions.map(s => s.id)));
     };
 
     const openDetail = (id) => {
@@ -162,7 +198,7 @@ export default function Dashboard() {
         setIsSyncing(true);
         try {
             for (const s of selectedSessions) {
-                await sendDataToGAS(s, FLOW_DATA_URL);
+                await sendDataToGAS(s, viewMode === 'master' ? BASIC_DATA_URL : FLOW_DATA_URL);
             }
             alert(`${selectedSessions.length}명의 데이터가 저장되었습니다.`);
             setSelectedSessionIds(new Set());
@@ -171,6 +207,20 @@ export default function Dashboard() {
         } finally {
             setIsSyncing(false);
         }
+    };
+
+    const handleBulkAttendanceDays = (day) => {
+        if (selectedSessionIds.size === 0) return;
+        setSessions(prev => prev.map(s => {
+            if (selectedSessionIds.has(s.id)) {
+                const currentDays = s.attendanceDays || [];
+                const newDays = currentDays.includes(day)
+                    ? currentDays.filter(d => d !== day)
+                    : [...currentDays, day];
+                return { ...s, attendanceDays: newDays };
+            }
+            return s;
+        }));
     };
 
     const handleBulkDelete = async () => {
@@ -380,16 +430,29 @@ export default function Dashboard() {
                 </div>
 
                 <nav className="px-3 space-y-1 py-4">
-                    <NavItem icon={<Clock size={16} />} label="Timeline" active />
+                    <NavItem icon={<Clock size={16} />} label="Timeline" active={viewMode === 'today'} onClick={() => setViewMode('today')} />
                     <NavItem icon={<AlertTriangle size={16} />} label="Backlog" badge="8" />
-                    <NavItem icon={<Users size={16} />} label="Students" />
+                    <NavItem icon={<Users size={16} />} label="Master DB" active={viewMode === 'master'} onClick={() => setViewMode('master')} />
                     <NavItem icon={<Calendar size={16} />} label="History" />
                 </nav>
 
                 <div className="flex-1 overflow-y-auto px-4 py-2 border-t border-zinc-900 space-y-6 scrollbar-hide">
-                    <div className="pt-2">
+                    {viewMode === 'master' && (
+                        <div className="pt-2 space-y-4 px-2 animate-in fade-in slide-in-from-top-2">
+                            <p className="text-[10px] font-black text-zinc-600 uppercase tracking-widest flex items-center gap-2">
+                                <Filter size={12} /> List Filters
+                            </p>
+                            <div className="space-y-2">
+                                <FilterSelect label="Class" value={filters.class} options={filterOptions.classes} onChange={v => setFilters({ ...filters, class: v })} />
+                                <FilterSelect label="School" value={filters.school} options={filterOptions.schools} onChange={v => setFilters({ ...filters, school: v })} />
+                                <FilterSelect label="Grade" value={filters.grade} options={filterOptions.grades} onChange={v => setFilters({ ...filters, grade: v })} />
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="pt-2 border-t border-zinc-900 mt-4">
                         <p className="text-[10px] font-black text-zinc-600 uppercase tracking-widest px-2 mb-4 flex items-center justify-between">
-                            Add Session
+                            {viewMode === 'master' ? "DB MANAGEMENT" : "TODAY'S ENTRY"}
                             {isSyncing && <Loader2 size={12} className="animate-spin text-indigo-500" />}
                         </p>
 
@@ -427,17 +490,23 @@ export default function Dashboard() {
                                         if (!text) return;
                                         const lines = text.trim().split('\n');
                                         const newSessions = lines.map(line => {
-                                            const [name, pHP, sHP, className, consDate, school, grade] = line.split('\t');
+                                            const cols = line.split('\t');
+                                            const [name, pHP, sHP, className, consDate, school, grade] = cols;
                                             if (!name) return null;
                                             return createBlankSession({
-                                                name, parentPhone: pHP, studentPhone: sHP, class: className,
-                                                consultDate: consDate, schoolName: school, grade
+                                                name: name.trim(),
+                                                parentPhones: pHP ? pHP.split(',').map(p => p.trim()) : [],
+                                                studentPhones: sHP ? sHP.split(',').map(p => p.trim()) : [],
+                                                classes: className ? className.split(',').map(c => c.trim()) : [],
+                                                consultDate: consDate,
+                                                schoolName: school,
+                                                grade
                                             });
                                         }).filter(Boolean);
                                         if (newSessions.length > 0) handleCreateSessions(newSessions);
                                     }}
                                 />
-                                <p className="text-[9px] text-zinc-600 text-center">Paste from Excel to import multiple</p>
+                                <p className="text-[9px] text-zinc-600 text-center uppercase tracking-tight">Paste Excel (Columns: 학생, 부모, 학생, 반, 상담, 학교, 학년)</p>
                             </div>
                         )}
                     </div>
@@ -459,23 +528,33 @@ export default function Dashboard() {
             <main className="flex-1 flex flex-col bg-[#09090b]">
                 <header className="h-16 border-b border-border flex items-center px-8 justify-between bg-background/50 backdrop-blur-md sticky top-0 z-10">
                     <div className="flex items-center gap-4">
-                        <h1 className="text-xl font-semibold tracking-tight">Today's Sessions</h1>
+                        <h1 className="text-xl font-semibold tracking-tight">{viewMode === 'today' ? "Today's Attendee" : "Master Database"}</h1>
                         <div className="h-4 w-px bg-zinc-800"></div>
-                        <p className="text-sm text-zinc-500 font-medium">{new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</p>
+                        <p className="text-sm text-zinc-500 font-medium">{viewMode === 'today' ? new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }) : `${sessions.length} Students Total`}</p>
                     </div>
                     <div className="flex items-center gap-3">
+                        {viewMode === 'master' && (
+                            <div className="flex items-center bg-zinc-900 border border-zinc-800 rounded-md p-0.5">
+                                <button onClick={() => setViewMode('today')} className={`px-3 py-1 text-[10px] font-bold rounded ${viewMode === 'today' ? 'bg-zinc-800 text-white' : 'text-zinc-500'}`}>Today</button>
+                                <button onClick={() => setViewMode('master')} className={`px-3 py-1 text-[10px] font-bold rounded ${viewMode === 'master' ? 'bg-zinc-800 text-white' : 'text-zinc-500'}`}>Database</button>
+                            </div>
+                        )}
                         <button
                             onClick={handleSaveAsNew}
                             disabled={isSyncing || sessions.length === 0}
                             className="h-9 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-zinc-800 text-white rounded-md text-sm font-bold shadow-lg shadow-emerald-500/10 transition-all flex items-center gap-2"
                         >
-                            <Save size={14} /> NEW SAVE (TAB)
+                            <Save size={14} /> EXPORT DB
                         </button>
                         <div className="relative">
                             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
-                            <input placeholder="Search students..." className="h-9 w-64 bg-zinc-900/50 border border-zinc-800 rounded-md pl-9 pr-4 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-700 transition-all placeholder:text-zinc-600" />
+                            <input
+                                placeholder="Search..."
+                                value={searchQuery}
+                                onChange={e => setSearchQuery(e.target.value)}
+                                className="h-9 w-64 bg-zinc-900/50 border border-zinc-800 rounded-md pl-9 pr-4 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-700 transition-all placeholder:text-zinc-600"
+                            />
                         </div>
-                        <button className="h-9 px-3 bg-zinc-900 border border-zinc-800 rounded-md text-sm font-medium text-zinc-400 hover:text-white transition-colors flex items-center gap-2"><Filter size={14} /> Filter</button>
                     </div>
                 </header>
 
@@ -489,12 +568,31 @@ export default function Dashboard() {
                             </div>
 
                             <div className="flex gap-10">
-                                <BulkGroup label="Voca" onUpdate={(val) => handleBulkUpdate('basic', 'voca', val)} />
-                                <BulkGroup label="Homework" onUpdate={(val) => handleBulkUpdate('homework', 'reading', val)} />
+                                {viewMode === 'today' ? (
+                                    <>
+                                        <BulkGroup label="Voca" onUpdate={(val) => handleBulkUpdate('basic', 'voca', val)} />
+                                        <BulkGroup label="Homework" onUpdate={(val) => handleBulkUpdate('homework', 'reading', val)} />
+                                    </>
+                                ) : (
+                                    <div className="flex items-center gap-2">
+                                        <p className="text-[10px] font-black text-zinc-600 uppercase tracking-widest mr-2">Assign Days:</p>
+                                        <div className="flex gap-1">
+                                            {weekDays.map(day => (
+                                                <button
+                                                    key={day}
+                                                    onClick={() => handleBulkAttendanceDays(day)}
+                                                    className={`w-8 h-8 rounded-lg text-[10px] font-bold transition-all border ${sessions.some(s => selectedSessionIds.has(s.id) && s.attendanceDays && s.attendanceDays.includes(day)) ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-zinc-800 border-zinc-700 text-zinc-500 hover:text-white'}`}
+                                                >
+                                                    {day[0]}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
                                 <div className="flex items-center gap-2">
-                                    <button onClick={() => handleBulkUpdate('summaryConfirmed', null, true)} className="h-9 px-4 bg-zinc-800 text-zinc-300 rounded-lg text-xs font-bold hover:bg-zinc-700 transition-colors">Bulk Confirm</button>
+                                    {viewMode === 'today' && <button onClick={() => handleBulkUpdate('summaryConfirmed', null, true)} className="h-9 px-4 bg-zinc-800 text-zinc-300 rounded-lg text-xs font-bold hover:bg-zinc-700 transition-colors">Bulk Confirm</button>}
                                     <button onClick={handleBulkSave} className="h-9 px-4 bg-indigo-600 rounded-lg text-xs font-bold shadow-lg shadow-indigo-500/20 hover:bg-indigo-500 transition-colors flex items-center gap-2">
-                                        <Save size={12} /> Bulk Save
+                                        <Save size={12} /> {viewMode === 'master' ? 'Apply to DB' : 'Sync Changes'}
                                     </button>
                                     <button onClick={handleBulkDelete} className="h-9 px-4 bg-red-600/20 text-red-500 border border-red-500/20 rounded-lg text-xs font-bold hover:bg-red-600 hover:text-white transition-all flex items-center gap-2">
                                         <X size={12} /> Bulk Delete
@@ -508,46 +606,84 @@ export default function Dashboard() {
 
                     <div className="max-w-6xl mx-auto space-y-2">
                         <div className="grid grid-cols-[48px_1.5fr_1fr_1fr_1fr_48px] gap-4 px-6 py-3 text-[11px] font-bold text-zinc-500 uppercase tracking-widest border-b border-zinc-900">
-                            <div className="flex justify-center"><input type="checkbox" className="w-4 h-4 rounded border-zinc-800 bg-zinc-900 accent-indigo-600" checked={selectedSessionIds.size === sessions.length} onChange={selectAll} /></div>
+                            <div className="flex justify-center">
+                                <input
+                                    type="checkbox"
+                                    className="w-4 h-4 rounded border-zinc-800 bg-zinc-900 accent-indigo-600"
+                                    checked={selectedSessionIds.size === filteredSessions.length && filteredSessions.length > 0}
+                                    onChange={selectAll}
+                                />
+                            </div>
                             <div>Student / Class</div>
-                            <div>Status</div>
-                            <div>Checks</div>
+                            <div>{viewMode === 'today' ? 'Status' : 'Attendance Days'}</div>
+                            <div>{viewMode === 'today' ? 'Checks' : 'Contacts'}</div>
                             <div>Last Edit</div>
                             <div></div>
                         </div>
 
-                        {sessions.map(s => (
+                        {filteredSessions.map(s => (
                             <div key={s.id}
                                 onClick={() => openDetail(s.id)}
-                                className={`grid grid-cols-[48px_1.5fr_1fr_1fr_1fr_48px] gap-4 px-6 py-4 rounded-xl items-center border transition-all cursor-pointer group ${selectedSessionIds.has(s.id) ? 'bg-indigo-500/[0.03] border-indigo-500/20' : 'bg-transparent border-transparent hover:bg-zinc-900/40 hover:border-zinc-800/50'}`}
+                                className={`grid grid-cols-[48px_1.5fr_1fr_1fr_1fr_48px] gap-4 px-6 py-4 rounded-xl items-center border transition-all cursor-pointer group ${selectedSessionIds.has(s.id) ? 'bg-indigo-500/[0.03] border-indigo-500/20 shadow-inner shadow-indigo-500/5' : 'bg-transparent border-transparent hover:bg-zinc-900/40 hover:border-zinc-800/50'}`}
                             >
                                 <div className="flex justify-center" onClick={e => e.stopPropagation()}>
                                     <input type="checkbox" className="w-4 h-4 rounded-md border-zinc-700 bg-zinc-900 accent-indigo-600" checked={selectedSessionIds.has(s.id)} onChange={() => toggleSelection(s.id)} />
                                 </div>
-                                <div className="flex items-center gap-4">
-                                    <div className="w-10 h-10 rounded-xl bg-zinc-800 border border-zinc-700 flex items-center justify-center font-bold text-zinc-300 group-hover:bg-indigo-600/20 group-hover:border-indigo-500/50 transition-all">{s.name.substring(0, 1)}</div>
-                                    <div>
-                                        <p className="font-bold text-zinc-100">{s.name}</p>
-                                        <p className="text-xs text-zinc-500 font-medium">{s.class} • {s.time}</p>
+                                <div className="flex items-center gap-4 min-w-0">
+                                    <div className="w-10 h-10 rounded-xl bg-zinc-800 border border-zinc-700 flex items-center justify-center font-black text-zinc-500 group-hover:bg-indigo-600/20 group-hover:border-indigo-500/50 group-hover:text-indigo-400 transition-all">{s.name.substring(0, 1)}</div>
+                                    <div className="min-w-0">
+                                        <div className="flex items-center gap-2 mb-0.5">
+                                            <span className="font-bold text-sm tracking-tight truncate text-zinc-200">{s.name}</span>
+                                            {viewMode === 'today' && <span className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase border tracking-widest ${getStatusColor(s.status)}`}>{s.status}</span>}
+                                        </div>
+                                        <div className="flex items-center gap-1 text-[10px] text-zinc-600 font-bold overflow-hidden">
+                                            {s.classes ? s.classes.map((c, i) => (
+                                                <span key={i} className="bg-zinc-900 px-1.5 py-0.5 rounded border border-zinc-800 whitespace-nowrap">{c}</span>
+                                            )) : <span className="bg-zinc-900 px-1.5 py-0.5 rounded border border-zinc-800">{s.class}</span>}
+                                        </div>
                                     </div>
                                 </div>
-                                <div>
-                                    <span className={`px-2.5 py-1 rounded-full text-[10px] font-black border border-current bg-opacity-10 ring-1 ring-inset ${getStatusColor(s.status)}`}>{s.status.toUpperCase()}</span>
+
+                                <div className="text-xs font-bold">
+                                    {viewMode === 'today' ? (
+                                        <div className="flex flex-col gap-1">
+                                            <span className="text-zinc-500 lowercase tracking-tighter">{s.type}</span>
+                                            <span className="text-zinc-300">{s.time}</span>
+                                        </div>
+                                    ) : (
+                                        <div className="flex flex-wrap gap-1">
+                                            {s.attendanceDays && s.attendanceDays.map(d => (
+                                                <span key={d} className="px-1.5 py-0.5 bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded text-[9px] font-black">{d.toUpperCase()}</span>
+                                            ))}
+                                            {(!s.attendanceDays || s.attendanceDays.length === 0) && <span className="text-zinc-700 text-[10px]">No days set</span>}
+                                        </div>
+                                    )}
                                 </div>
-                                <div className="flex gap-1.5 grayscale opacity-50 group-hover:grayscale-0 group-hover:opacity-100 transition-all">
-                                    <CheckStatusIcon status={s.checks.basic.voca} size={12} />
-                                    <CheckStatusIcon status={s.checks.homework.reading} size={12} />
-                                    {s.backlogCount > 5 && <div className="ml-2 flex items-center text-red-500 text-[10px] font-black gap-0.5 animate-pulse"><AlertTriangle size={12} /> {s.backlogCount}</div>}
+
+                                <div className="text-[11px] font-medium text-zinc-500">
+                                    {viewMode === 'today' ? (
+                                        <div className="flex gap-1">
+                                            <CheckStatusIcon status={s.checks.basic.voca} size={12} />
+                                            <CheckStatusIcon status={s.checks.homework.reading} size={12} />
+                                            {s.backlogCount > 0 && <span className="text-red-500 font-bold ml-1">+{s.backlogCount}</span>}
+                                        </div>
+                                    ) : (
+                                        <div className="flex flex-col gap-0.5">
+                                            <span className="truncate">P: {s.parentPhones?.[0] || 'N/A'}</span>
+                                            <span className="truncate">S: {s.studentPhones?.[0] || 'N/A'}</span>
+                                        </div>
+                                    )}
                                 </div>
-                                <div className="text-sm text-zinc-500 font-medium">{s.lastEditedBy}</div>
-                                <div className="text-zinc-700 group-hover:text-zinc-400 transition-colors flex items-center gap-3">
+
+                                <div className="text-[11px] text-zinc-500 font-medium italic">{s.lastEditedBy}</div>
+
+                                <div className="flex justify-end pr-2" onClick={e => e.stopPropagation()}>
                                     <button
                                         onClick={(e) => handleIndividualDelete(e, s.id)}
-                                        className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-lg transition-all opacity-0 group-hover:opacity-100"
+                                        className="p-2 hover:bg-red-500/10 hover:text-red-500 rounded-lg transition-all opacity-0 group-hover:opacity-100"
                                     >
                                         <X size={16} />
                                     </button>
-                                    <ChevronRight size={20} />
                                 </div>
                             </div>
                         ))}
@@ -680,10 +816,13 @@ function SidebarInput({ ...props }) {
 }
 
 // Subcomponents
-function NavItem({ icon, label, active, badge }) {
+function NavItem({ icon, label, active, badge, onClick }) {
     return (
-        <div className={`flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-all ${active ? 'bg-zinc-900 text-white' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/50'}`}>
-            {icon}
+        <div
+            onClick={onClick}
+            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-all ${active ? 'bg-zinc-900 text-white shadow-inner shadow-black/50' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/50'}`}
+        >
+            <div className={active ? 'text-indigo-500' : ''}>{icon}</div>
             <span className="text-sm font-bold flex-1">{label}</span>
             {badge && <span className="bg-red-500/20 text-red-500 text-[10px] font-black px-1.5 py-0.5 rounded-full">{badge}</span>}
         </div>
@@ -746,13 +885,29 @@ function BulkGroup({ label, onUpdate }) {
     );
 }
 
+function FilterSelect({ label, value, options, onChange }) {
+    return (
+        <div className="space-y-1">
+            <label className="text-[9px] font-bold text-zinc-700 uppercase ml-1">{label}</label>
+            <select
+                value={value}
+                onChange={e => onChange(e.target.value)}
+                className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1.5 text-[11px] text-zinc-300 focus:outline-none focus:ring-1 focus:ring-zinc-700 transition-all cursor-pointer hover:bg-zinc-800/50"
+            >
+                {options.map(opt => <option key={opt} value={opt}>{opt === 'All' ? `All ${label}s` : opt}</option>)}
+            </select>
+        </div>
+    );
+}
+
 const createBlankSession = (data) => ({
     id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
     studentId: "st_" + Math.random().toString(36).substring(2, 7),
     name: (data.name || "Unknown").trim(),
-    parentPhone: data.parentPhone || "",
-    studentPhone: data.studentPhone || "",
-    class: data.class || "Unassigned",
+    parentPhones: data.parentPhones || [],
+    studentPhones: data.studentPhones || [],
+    classes: data.classes || (data.class ? [data.class] : ["Unassigned"]),
+    attendanceDays: data.attendanceDays || [],
     consultDate: data.consultDate || "",
     schoolName: data.schoolName || "",
     grade: data.grade || "",
