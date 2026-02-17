@@ -1,28 +1,38 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+// Dashboard.jsx 맨 위에 추가
 import {
-    Users, CheckSquare, MessageSquare, Save, Search, Filter,
-    MoreHorizontal, ChevronRight, ChevronLeft, Pin, Check, X, AlertTriangle,
-    ChevronDown, Copy, Send, LogOut, Clock, Calendar, Plus, UserPlus, Layers, Loader2,
-    Bell, CheckCircle2, FileText, Mail, ArrowUpDown, DownloadCloud, Zap, BarChart3, Settings, Database
+    useSessions,
+    useImportHistory,
+    useFilters,
+    sendToGAS,
+    migrateFromLocalStorage,
+    normalizeSession
+} from './user_log';
+
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import {
+    Users, MessageSquare, Save, Search,
+    ChevronRight, ChevronLeft, Pin, X,
+    ChevronDown, Clock, Calendar, Plus, UserPlus, Layers, Loader2,
+    Bell, FileText, DownloadCloud, Zap, Database,
 } from 'lucide-react';
+import { toast } from 'sonner';
 
-const getDeptFromClassName = (className) => {
-    if (!className) return "기타";
-    const nameStr = String(className).trim();
-    if (nameStr.length < 3) return "기타";
-    const thirdFromRight = nameStr.charAt(nameStr.length - 3);
-    if (thirdFromRight === '1') return "2단지";
-    if (thirdFromRight === '2') return "10단지";
-    return "기타";
-};
+import CourseCheckGroup from './components/CourseCheckGroup';
+import BulkActionBar from './components/BulkActionBar';
+import MemoModal from './components/MemoModal';
 
-// --- View Constants ---
+// ─── 상수 ──────────────────────────────────────────────────────────────────
+
+const GAS_URL = "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec";
+
+const DAYS = ['월', '화', '수', '목', '금', '토', '일'];
+
 const COURSEWORK_AREAS = [
     { key: 'reading', label: 'R' },
     { key: 'grammar', label: 'G' },
     { key: 'practice', label: 'P' },
     { key: 'listening', label: 'L' },
-    { key: 'etc', label: 'E' }
+    { key: 'etc', label: 'E' },
 ];
 
 const RETENTION_AREAS = [
@@ -34,130 +44,164 @@ const RETENTION_AREAS = [
     { key: 'practice', label: 'P' },
     { key: 'listening', label: 'L' },
     { key: 'isc', label: 'W' },
-    { key: 'etc', label: 'E' }
+    { key: 'etc', label: 'E' },
 ];
 
+// ─── 유틸 ──────────────────────────────────────────────────────────────────
 
 const getNormalizedGrade = (s) => {
-    if (!s.schoolName || !s.grade) return "기타";
+    if (!s.schoolName || !s.grade) return '기타';
     const school = s.schoolName.toString();
     const gradeVal = s.grade.toString();
-    const numMatch = gradeVal.match(/\d/);
-    const num = numMatch ? numMatch[0] : "";
 
-    if (school.includes('초')) {
-        if (['4', '5', '6'].includes(num)) return `초${num}`;
-    } else if (school.includes('중')) {
-        if (['1', '2', '3'].includes(num)) return `중${num}`;
-    } else if (school.includes('고')) {
-        if (['1', '2', '3'].includes(num)) return `고${num}`;
-    }
-
-    // 학년 컬럼 자체가 "초4" 형식인 경우도 체크
     const directMatch = gradeVal.match(/(초|중|고)([1-6])/);
     if (directMatch) {
-        const type = directMatch[1];
-        const n = directMatch[2];
+        const [, type, n] = directMatch;
         if (type === '초' && ['4', '5', '6'].includes(n)) return `초${n}`;
         if (type === '중' && ['1', '2', '3'].includes(n)) return `중${n}`;
         if (type === '고' && ['1', '2', '3'].includes(n)) return `고${n}`;
     }
 
-    return "기타";
+    const num = (gradeVal.match(/\d/) || [])[0] || '';
+    if (school.includes('초') && ['4', '5', '6'].includes(num)) return `초${num}`;
+    if (school.includes('중') && ['1', '2', '3'].includes(num)) return `중${num}`;
+    if (school.includes('고') && ['1', '2', '3'].includes(num)) return `고${num}`;
+
+    return '기타';
 };
 
-// Mock Data
-const INITIAL_SESSIONS = [];
+const toArray = (val) => {
+    if (!val) return [];
+    if (Array.isArray(val)) return val;
+    if (typeof val === 'string') return val.split(/[,|/\s]+/).filter(Boolean);
+    return [];
+};
 
-const getStatusColor = (status) => {
-    switch (status) {
-        case 'attendance': return 'bg-green-500/10 text-green-500 border-green-500/20';
-        case 'late': return 'bg-yellow-500/10 text-yellow-500 border-yellow-500/20';
-        case 'absent': return 'bg-red-500/10 text-red-500 border-red-500/20';
-        case 'waiting': return 'bg-zinc-500/10 text-zinc-500 border-zinc-500/20';
-        default: return 'bg-zinc-500/10 text-zinc-500 border-zinc-500/20';
+// 요일 매칭 헬퍼 (배열/문자열, 쉼표/공백 구분 등 모두 대응)
+const isDayMatch = (daysBase, targetDay) => {
+    if (!daysBase) return false;
+    const arr = Array.isArray(daysBase) ? daysBase : (typeof daysBase === 'string' ? daysBase.split(/[,|/\s]+/) : []);
+    return arr.some(d => d.trim().includes(targetDay));
+};
+
+/**
+ * rawMemo(string) → 메모 배열 파싱
+ * 레거시 순수 문자열도 처리
+ */
+const parseMemos = (rawMemo) => {
+    if (!rawMemo) return [];
+    try {
+        const parsed = JSON.parse(rawMemo);
+        return Array.isArray(parsed) ? parsed : [{ id: 'legacy', text: rawMemo, date: '' }];
+    } catch {
+        return [{ id: 'legacy', text: rawMemo, date: '' }];
     }
 };
 
+/**
+ * 빈 세션 객체 생성
+ */
+const createBlankSession = (data) => {
+    const schoolParts = String(data.schoolGrade || '').split(' ');
+    return {
+        id: data.id || (Date.now().toString() + Math.random().toString(36).substring(2, 9)),
+        studentId: 'st_' + Math.random().toString(36).substring(2, 7),
+        name: (data.name || 'Unknown').trim(),
+        department: data.department || '기타',
+        parentPhones: data.parentPhones || [],
+        studentPhones: data.studentPhones || [],
+        classes: data.classes || ['Unassigned'],
+        attendanceDays: data.attendanceDays || [],
+        attendanceTime: data.attendanceTime || '',
+        specialDays: data.specialDays || [],
+        specialTime: data.specialTime || '',
+        extraDays: data.extraDays || [],
+        schoolName: schoolParts[0] || '',
+        grade: schoolParts.slice(1).join(' ') || '',
+        status: 'waiting',
+        backlogCount: 0,
+        lastEditedBy: 'Teacher Kim',
+        checks: {
+            basic: { voca: 'none', idiom: 'none', step3: 'none', isc: 'none' },
+            homework: { reading: 'none', grammar: 'none', practice: 'none', listening: 'none', etc: 'none' },
+            review: { reading: 'none', grammar: 'none', practice: 'none', listening: 'none' },
+            nextHomework: { reading: '', grammar: '', practice: '', listening: '', extra: '' },
+            memos: { toDesk: '', fromDesk: '', toParent: '' },
+            homeworkResult: 'none',
+            summaryConfirmed: false,
+        },
+    };
+};
+
+// ─── GAS 통신 ───────────────────────────────────────────────────────────────
+
+const sendDataToGAS = async (data) => {
+    try {
+        await fetch(GAS_URL, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                date: data.date || new Date().toISOString().split('T')[0],
+                timestamp: new Date().toISOString(),
+                ...data,
+            }),
+        });
+        return true;
+    } catch (error) {
+        console.error('GAS 전송 실패:', error);
+        toast.error('전송 중 오류가 발생했습니다: ' + error.message);
+        return false;
+    }
+};
+
+// ─── Dashboard (메인 컴포넌트) ──────────────────────────────────────────────
+
 export default function Dashboard() {
     const dateInputRef = useRef(null);
-    const [sessions, setSessions] = useState(INITIAL_SESSIONS);
-    const [selectedSessionIds, setSelectedSessionIds] = useState(new Set());
-    const [selectedHomeworkAreas, setSelectedHomeworkAreas] = useState(new Set());
-    const [homeworkSubView, setHomeworkSubView] = useState(null); // null(overview), '1st', '2nd', 'next'
+
+    // ── 세션 ──
+    // Dashboard 컴포넌트 내부 최상단에 붙여넣기
+    const { sessions, setSessions, isLoaded, pendingCount, sync, flush } = useSessions(GAS_URL);
+    const { importHistory, setImportHistory } = useImportHistory();
+    const { filters, setFilters, isFilterPinned, setIsFilterPinned, clearFilters: clearFiltersFromStore } = useFilters();
+
+    // ── 뷰 ──
+    const [viewMode, setViewMode] = useState('today');
+    const [homeworkSubView, setHomeworkSubView] = useState(null); // null | '1st' | '2nd' | 'next'
     const [isHomeworkExpanded, setIsHomeworkExpanded] = useState(false);
     const [isRetentionExpanded, setIsRetentionExpanded] = useState(false);
-    const [showDetailPanel, setShowDetailPanel] = useState(false);
+    const [selectedDate, setSelectedDate] = useState(new Date());
+
+    // ── 선택 / 필터 ──
+    const [selectedSessionIds, setSelectedSessionIds] = useState(new Set());
+    const [selectedHomeworkAreas, setSelectedHomeworkAreas] = useState(new Set());
+    const [searchQuery, setSearchQuery] = useState('');
+    const [isSyncing, setIsSyncing] = useState(false);
+
+
+
+    // ── 메모 모달 ──
     const [showMemoModal, setShowMemoModal] = useState(false);
     const [activeMemoStudent, setActiveMemoStudent] = useState(null);
-    const [stagingEditData, setStagingEditData] = useState({ department: '', className: '', schoolGrade: '', days: [], time: '' });
-    const [currentSessionId, setCurrentSessionId] = useState(null);
-    const [isSyncing, setIsSyncing] = useState(false);
-    const [viewMode, setViewMode] = useState('today');
-    const [searchQuery, setSearchQuery] = useState('');
-    const [filters, setFilters] = useState(() => {
-        const saved = localStorage.getItem('impact7_filters');
-        if (saved) {
-            const parsed = JSON.parse(saved);
-            return {
-                departments: Array.isArray(parsed.departments) ? parsed.departments : [],
-                grades: Array.isArray(parsed.grades) ? parsed.grades : [],
-                class: parsed.class || 'All',
-                school: parsed.school || 'All'
-            };
-        }
-        return { departments: [], grades: [], class: 'All', school: 'All' };
-    });
 
-    const [isLoaded, setIsLoaded] = useState(false);
-    const [cloudTabs, setCloudTabs] = useState([]);
-    const [selectedDate, setSelectedDate] = useState(new Date());
-    const [isFilterPinned, setIsFilterPinned] = useState(localStorage.getItem('impact7_pinned') === 'true');
+    // ── 학생 프로필 모달 ──
+    const [showProfileModal, setShowProfileModal] = useState(false);
+    const [activeProfileStudent, setActiveProfileStudent] = useState(null);
 
-    const allGrades = useMemo(() => {
-        const set = new Set(sessions.map(s => {
-            if (!s.grade) return null;
-            // "초3"에서 "3"만 추출하거나 이미 숫자인 경우
-            const matched = s.grade.toString().match(/\d+/);
-            return matched ? matched[0] : s.grade.toString();
-        }).filter(Boolean));
-        return Array.from(set).sort((a, b) => a - b);
-    }, [sessions]);
+    // ── 일괄 액션 ──
+    const [bulkMemo, setBulkMemo] = useState('');
 
-    const toggleFilter = (type, value) => {
-        setFilters(prev => {
-            const current = prev[type] || [];
-            let next = [...current];
-            if (next.includes(value)) {
-                next = next.filter(v => v !== value);
-            } else {
-                next = [...next, value];
-            }
-            return { ...prev, [type]: next };
-        });
-    };
-
-    const clearFilters = () => {
-        setFilters({ departments: [], grades: [], class: 'All', school: 'All' });
-        setIsFilterPinned(false);
-        localStorage.removeItem('impact7_filters');
-        localStorage.setItem('impact7_pinned', 'false');
-    };
-
-
-    // Sidebar & Import Logic States
-    const [sidebarSelectedIds, setSidebarSelectedIds] = useState(new Set());
+    // ── Task Deferral ──
     const [deferDate, setDeferDate] = useState(() => {
-        const tomorrow = new Date();
-        tomorrow.setDate(tomorrow.getDate() + 1);
-        return tomorrow.toISOString().split('T')[0];
+        const d = new Date();
+        d.setDate(d.getDate() + 1);
+        return d.toISOString().split('T')[0];
     });
     const [deferTime, setDeferTime] = useState('18:00');
     const [deferTasks, setDeferTasks] = useState(['']);
-    const [bulkPastedText, setBulkPastedText] = useState('');
 
-    // Import Staging States
-    const [importHistory, setImportHistory] = useState([]); // [{id, name, students}]
+    // ── Import ──
     const [activeImportId, setActiveImportId] = useState(null);
     const [importSelectedIds, setImportSelectedIds] = useState(new Set());
     const [importSearchQuery, setImportSearchQuery] = useState('');
@@ -165,304 +209,57 @@ export default function Dashboard() {
     const [importBatchTime, setImportBatchTime] = useState('');
     const [importSpecialBatchDays, setImportSpecialBatchDays] = useState([]);
     const [importSpecialBatchTime, setImportSpecialBatchTime] = useState('');
+    const [importArbitraryBatchDays, setImportArbitraryBatchDays] = useState([]);
     const [importBatchStartDate, setImportBatchStartDate] = useState('');
     const [importBatchEndDate, setImportBatchEndDate] = useState('');
+    const [bulkPastedText, setBulkPastedText] = useState('');
+    const [cloudTabs, setCloudTabs] = useState([]);
 
-    // UI Toggle States
-    const [showSidebarAdd, setShowSidebarAdd] = useState(false);
-
-    const handleInstantStatus = async (session, newStatus) => {
-        setIsSyncing(true);
-        try {
-            // 토글 로직: 이미 해당 상태라면 waiting으로 되돌림
-            const targetStatus = session.status === newStatus ? 'waiting' : newStatus;
-            const updated = { ...session, status: targetStatus };
-
-            if (targetStatus === 'attendance') updated.checks.summaryConfirmed = true;
-            else if (targetStatus === 'waiting') updated.checks.summaryConfirmed = false;
-
-            // UI 선반영
-            setSessions(prev => prev.map(ps => ps.id === session.id ? updated : ps));
-
-            // GAS 동기화
-            await sendDataToGAS(updated, "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec");
-        } catch (error) {
-            console.error("Status Update Failed:", error);
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const handleBulkStatusUpdate = async (status) => {
-        setIsSyncing(true);
-        try {
-            const selectedIds = Array.from(selectedSessionIds);
-            const updatedSessions = sessions.map(s => {
-                if (selectedSessionIds.has(s.id)) {
-                    const updated = { ...s, status: status };
-                    if (status === 'attendance') updated.checks.summaryConfirmed = true;
-                    return updated;
-                }
-                return s;
-            });
-
-            setSessions(updatedSessions);
-
-            for (const id of selectedIds) {
-                const student = updatedSessions.find(s => s.id === id);
-                if (student) await sendDataToGAS(student, "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec");
-            }
-
-            setSelectedSessionIds(new Set());
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const [bulkMemo, setBulkMemo] = useState('');
-    const handleDeleteMemo = async (studentId, memoId) => {
-        setIsSyncing(true);
-        try {
-            const updatedSessions = sessions.map(s => {
-                if (s.id === studentId) {
-                    const rawMemo = s.checks?.memos?.toDesk;
-                    let currentMemos = [];
-                    try {
-                        currentMemos = JSON.parse(rawMemo);
-                        if (!Array.isArray(currentMemos)) throw new Error();
-                    } catch (e) {
-                        return s; // Cannot delete from non-array format
-                    }
-
-                    const filteredMemos = currentMemos.filter(m => m.id !== memoId);
-                    const updated = {
-                        ...s,
-                        checks: {
-                            ...s.checks,
-                            memos: {
-                                ...s.checks?.memos,
-                                toDesk: filteredMemos.length > 0 ? JSON.stringify(filteredMemos) : ""
-                            }
-                        }
-                    };
-
-                    // Sync to GAS
-                    sendDataToGAS(updated, "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec");
-
-                    // Update active student view if open
-                    if (activeMemoStudent && activeMemoStudent.id === s.id) {
-                        setActiveMemoStudent(updated);
-                    }
-
-                    return updated;
-                }
-                return s;
-            });
-            setSessions(updatedSessions);
-        } catch (error) {
-            console.error("Memo delete failed:", error);
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const handleHomeworkCellUpdate = async (session, step, area, value) => {
-        setIsSyncing(true);
-        try {
-            const currentStepData = session.checks[step] || {};
-            const newStepData = { ...currentStepData, [area]: value };
-
-            const updated = {
-                ...session,
-                checks: {
-                    ...session.checks,
-                    [step]: newStepData
-                }
-            };
-
-            setSessions(prev => prev.map(s => s.id === session.id ? updated : s));
-            await sendDataToGAS(updated, "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec");
-        } catch (error) {
-            console.error("Homework Update Failed:", error);
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const handleSubViewUpdate = (subView, masterView = 'coursework') => {
-        setHomeworkSubView(subView);
-        setViewMode(masterView);
-    };
-
-    const handleBulkHomeworkUpdate = async (value) => {
-        if (selectedHomeworkAreas.size === 0) {
-            alert("적용할 영역(Area)을 하나 이상 선택해주세요.");
-            return;
-        }
-        setIsSyncing(true);
-        try {
-            const selectedIds = Array.from(selectedSessionIds);
-            const targetPrefix = viewMode === 'retention' ? 'retention' : 'homework';
-            let targetStep = `${targetPrefix}1`;
-            if (homeworkSubView === '1st') targetStep = `${targetPrefix}1`;
-            else if (homeworkSubView === '2nd') targetStep = `${targetPrefix}2`;
-            else if (homeworkSubView === 'next') targetStep = `${targetPrefix}Next`;
-
-            const updatedSessions = sessions.map(s => {
-                if (selectedSessionIds.has(s.id)) {
-                    const currentStepData = s.checks[targetStep] || {};
-                    const newStepData = { ...currentStepData };
-
-                    if (homeworkSubView !== 'next') {
-                        selectedHomeworkAreas.forEach(area => {
-                            newStepData[area] = value;
-                        });
-                    }
-
-                    return {
-                        ...s,
-                        checks: { ...s.checks, [targetStep]: newStepData }
-                    };
-                }
-                return s;
-            });
-            setSessions(updatedSessions);
-
-            for (const id of selectedIds) {
-                const student = updatedSessions.find(s => s.id === id);
-                if (student) await sendDataToGAS(student, "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec");
-            }
-            setSelectedSessionIds(new Set());
-            setSelectedHomeworkAreas(new Set());
-            alert('일괄 수정이 완료되었습니다.');
-        } catch (error) {
-            console.error(error);
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const handleBulkMemoUpdate = async () => {
-        if (!bulkMemo.trim()) return;
-        setIsSyncing(true);
-        try {
-            const selectedIds = Array.from(selectedSessionIds);
-            const updatedSessions = sessions.map(s => {
-                if (selectedSessionIds.has(s.id)) {
-                    let currentMemos = [];
-                    const rawMemo = s.checks?.memos?.toDesk;
-                    try {
-                        if (rawMemo) {
-                            const parsed = JSON.parse(rawMemo);
-                            currentMemos = Array.isArray(parsed) ? parsed : [{ id: 'legacy-' + Date.now(), text: rawMemo, date: new Date().toISOString() }];
-                        }
-                    } catch (e) {
-                        currentMemos = [{ id: 'legacy-' + Date.now(), text: rawMemo, date: new Date().toISOString() }];
-                    }
-
-                    const newMemoObj = {
-                        id: Date.now() + Math.random().toString(36).slice(2),
-                        text: bulkMemo,
-                        date: new Date().toISOString()
-                    };
-
-                    return {
-                        ...s,
-                        checks: {
-                            ...s.checks,
-                            memos: {
-                                ...s.checks?.memos,
-                                toDesk: JSON.stringify([...currentMemos, newMemoObj])
-                            }
-                        }
-                    };
-                }
-                return s;
-            });
-
-            setSessions(updatedSessions);
-
-            for (const id of selectedIds) {
-                const student = updatedSessions.find(s => s.id === id);
-                if (student) await sendDataToGAS(student, "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec");
-            }
-
-            setBulkMemo('');
-            setSelectedSessionIds(new Set());
-            alert('선택된 학생들에게 메모가 일괄 적용되었습니다.');
-        } catch (error) {
-            console.error(error);
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const handleHomeworkSubValues = (subView) => {
-        if (subView === '2nd') {
-            // Logic handled on bulk update action, here just switch UI scope
-        }
-        setHomeworkSubView(subView);
-        setViewMode('master');
-    };
-
-
+    // ── Import Sidebar 패널 토글 ──
     const [showSidebarEdit, setShowSidebarEdit] = useState(false);
+    const [showSidebarAdd, setShowSidebarAdd] = useState(false);
     const [showExcelBridge, setShowExcelBridge] = useState(false);
     const [showHistory, setShowHistory] = useState(false);
 
-    // Individual Add Form State
+    // ── Individual Add 폼 ──
     const [addFormDays, setAddFormDays] = useState([]);
     const [addFormTime, setAddFormTime] = useState('');
 
+    // ── Import 편집 폼 ──
     const [localEditForm, setLocalEditForm] = useState({
         dept: '', name: '', class: '', schoolGrade: '', days: [], time: '',
-        specialDays: [], specialTime: '', startDate: '', endDate: ''
+        specialDays: [], specialTime: '', startDate: '', endDate: '',
+        extraDays: [],
     });
 
-    const addTask = () => setDeferTasks([...deferTasks, '']);
-    const removeTask = (index) => {
-        if (deferTasks.length > 1) setDeferTasks(deferTasks.filter((_, i) => i !== index));
-        else setDeferTasks(['']);
-    };
+    // ── 초기 로드 ──
 
-    // --- Persistence & Auto-filter Logic ---
-    useEffect(() => {
-        const savedSessions = localStorage.getItem('impact7_sessions');
-        if (savedSessions) setSessions(JSON.parse(savedSessions));
-        const savedHistory = localStorage.getItem('impact7_history');
-        if (savedHistory) setImportHistory(JSON.parse(savedHistory));
-        setIsLoaded(true);
-    }, []);
 
-    useEffect(() => {
-        if (!isLoaded) return;
-        localStorage.setItem('impact7_sessions', JSON.stringify(sessions));
-        localStorage.setItem('impact7_history', JSON.stringify(importHistory));
-        if (isFilterPinned) {
-            localStorage.setItem('impact7_filters', JSON.stringify(filters));
-        }
-    }, [sessions, importHistory, filters, isFilterPinned, isLoaded]);
+    // ── 초기 로드 및 영속화는 useSessions, useImportHistory, useFilters 훅에서 관리됨 ──
 
-    const todayName = useMemo(() => ['일', '월', '화', '수', '목', '금', '토'][selectedDate.getDay()], [selectedDate]);
-
-    // 자동 동기화: 사이트 접속 시 sessions가 비어있으면 서버에서 데이터를 자동으로 가져옴
+    // ── 자동 동기화 (세션 비어있을 때) ──
     useEffect(() => {
         if (isLoaded && sessions.length === 0 && viewMode === 'today') {
-            console.log("Auto-syncing from Cloud...");
             handleCloudSync();
         }
-    }, [isLoaded, sessions.length, viewMode]);
-    // ---------------------------------------
+    }, [isLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ── 파생 값 ──
+    const todayName = useMemo(
+        () => ['일', '월', '화', '수', '목', '금', '토'][selectedDate.getDay()],
+        [selectedDate]
+    );
+
 
     const filteredSessions = useMemo(() => {
         const query = searchQuery.toLowerCase().trim();
-        const orGroups = query ? query.split(/[,|]/).map(g => g.trim()).filter(Boolean) : [];
-        const processedOrGroups = orGroups.map(group => group.split(/\s+/).filter(Boolean));
+        const orGroups = query
+            ? query.split(/[,|]/).map(g => g.trim()).filter(Boolean).map(g => g.split(/\s+/).filter(Boolean))
+            : [];
 
         return sessions.filter(s => {
-            // 1. Search Query Filter
-            if (processedOrGroups.length > 0) {
-                const matchesSearch = processedOrGroups.some(tokens =>
+            if (orGroups.length > 0) {
+                const matches = orGroups.some(tokens =>
                     tokens.every(token =>
                         s.name.toLowerCase().includes(token) ||
                         (s.studentId && s.studentId.toLowerCase().includes(token)) ||
@@ -471,104 +268,90 @@ export default function Dashboard() {
                         (s.schoolName && s.schoolName.toLowerCase().includes(token)) ||
                         (s.grade && s.grade.toLowerCase().includes(token)) ||
                         (s.attendanceDays && s.attendanceDays.some(d => d.toLowerCase().includes(token))) ||
-                        (s.time && s.time.toLowerCase().includes(token))
+                        (s.attendanceTime && s.attendanceTime.toLowerCase().includes(token))
                     )
                 );
-                if (!matchesSearch) return false;
+                if (!matches) return false;
             }
 
-            // 2. Department & Grade Filters
-            const normalizedGrade = getNormalizedGrade(s);
+            const ng = getNormalizedGrade(s);
             if (filters.departments.length > 0 && !filters.departments.includes(s.department)) return false;
-            if (filters.grades.length > 0 && !filters.grades.includes(normalizedGrade)) return false;
-
-            // 3. Class & School Filters (Sidebar Selects)
+            if (filters.grades.length > 0 && !filters.grades.includes(ng)) return false;
             if (filters.class !== 'All' && !(s.classes && s.classes.includes(filters.class))) return false;
             if (filters.school !== 'All' && s.schoolName !== filters.school) return false;
 
-            // 4. Today Filter (Attendance Logic)
-            const isScheduledToday = s.attendanceDays && s.attendanceDays.includes(todayName);
-            if (viewMode === 'today' || viewMode === 'coursework' || viewMode === 'retention') {
-                return isScheduledToday;
-            }
+            // 요일 필터링 (정규 + 특강 + 임의 통합)
+            const isRegToday = isDayMatch(s.attendanceDays, todayName);
+            const isSpecToday = isDayMatch(s.specialDays, todayName);
+            const isExtraToday = isDayMatch(s.extraDays, todayName);
 
+            if (['today', 'coursework', 'retention'].includes(viewMode)) {
+                return (isRegToday || isSpecToday || isExtraToday);
+            }
             return true;
         }).sort((a, b) => {
-            const classA = (a.classes && a.classes[0]) || "";
-            const classB = (b.classes && b.classes[0]) || "";
-            if (classA !== classB) return classA.localeCompare(classB);
-            return a.name.localeCompare(b.name);
+            const ca = (a?.classes?.[0]) || '';
+            const cb = (b?.classes?.[0]) || '';
+            if (ca !== cb) return (ca.toString()).localeCompare(cb.toString());
+            return (a?.name || '').localeCompare(b?.name || '');
         });
     }, [sessions, searchQuery, filters, viewMode, todayName]);
 
-
     const sidebarFilteredStudents = useMemo(() => {
         if (!searchQuery.trim()) return [];
-        const query = searchQuery.toLowerCase();
+        const q = searchQuery.toLowerCase();
         return sessions.filter(s =>
-            s.name.toLowerCase().includes(query) ||
-            (s.classes && s.classes.some(c => c.toLowerCase().includes(query))) ||
-            (s.schoolName && s.schoolName.toLowerCase().includes(query)) ||
-            (s.grade && s.grade.toLowerCase().includes(query))
+            s.name.toLowerCase().includes(q) ||
+            (s.classes && s.classes.some(c => c.toLowerCase().includes(q))) ||
+            (s.schoolName && s.schoolName.toLowerCase().includes(q)) ||
+            (s.grade && s.grade.toLowerCase().includes(q))
         ).slice(0, 50);
     }, [sessions, searchQuery]);
 
     const stagedFilteredStudents = useMemo(() => {
-        const currentImport = importHistory.find(h => h.id === activeImportId);
-        if (!currentImport) return [];
-        const students = currentImport.students || [];
+        const current = importHistory.find(h => h.id === activeImportId);
+        if (!current) return [];
+        const students = current.students || [];
         const q = importSearchQuery.toLowerCase().trim();
         if (!q) return students;
 
         const orGroups = q.split(/[,|]/).map(g => g.trim()).filter(Boolean);
-        if (orGroups.length === 0) return students;
-
-        return students.filter(st => {
-            return orGroups.some(group => {
+        return students.filter(st =>
+            orGroups.some(group => {
                 const tokens = group.split(/\s+/).filter(Boolean);
-                if (tokens.length === 0) return false;
-                return tokens.every(token =>
+                return tokens.length > 0 && tokens.every(token =>
                     st.name.toLowerCase().includes(token) ||
-                    (st.classes?.[0] || "").toLowerCase().includes(token) ||
-                    (st.department || "").toLowerCase().includes(token) ||
-                    (st.schoolName || "").toLowerCase().includes(token) ||
-                    (st.grade || "").toLowerCase().includes(token) ||
+                    (st.classes?.[0] || '').toLowerCase().includes(token) ||
+                    (st.department || '').toLowerCase().includes(token) ||
+                    (st.schoolName || '').toLowerCase().includes(token) ||
+                    (st.grade || '').toLowerCase().includes(token) ||
                     (Array.isArray(st.attendanceDays) && st.attendanceDays.some(d => d.toLowerCase().includes(token))) ||
                     (st.attendanceTime && st.attendanceTime.toLowerCase().includes(token))
                 );
-            });
-        });
+            })
+        );
     }, [importHistory, activeImportId, importSearchQuery]);
 
     const filterOptions = useMemo(() => {
         const classes = new Set();
         const schools = new Set();
-        const grades = new Set();
         sessions.forEach(s => {
-            if (s.classes) s.classes.forEach(c => classes.add(c));
+            s.classes?.forEach(c => classes.add(c));
             if (s.schoolName) schools.add(s.schoolName);
-            if (s.grade) grades.add(s.grade);
         });
         return {
             classes: ['All', ...Array.from(classes).sort()],
             schools: ['All', ...Array.from(schools).sort()],
-            grades: ['All', ...Array.from(grades).sort()]
         };
     }, [sessions]);
 
-    const toggleSelection = (id) => {
-        const newSet = new Set(selectedSessionIds);
-        if (newSet.has(id)) newSet.delete(id);
-        else newSet.add(id);
-        setSelectedSessionIds(newSet);
-    };
-
-    // Effect to sync single selection to edit form
-    useMemo(() => {
-        if (viewMode === 'import' && importSelectedIds.size === 1) {
+    // Import 단일 선택 시 편집 폼 동기화
+    useEffect(() => {
+        if (viewMode !== 'import') return;
+        if (importSelectedIds.size === 1) {
             const studentId = Array.from(importSelectedIds)[0];
-            const currentImport = importHistory.find(h => h.id === activeImportId);
-            const student = currentImport?.students.find(s => s.id === studentId);
+            const current = importHistory.find(h => h.id === activeImportId);
+            const student = current?.students.find(s => s.id === studentId);
             if (student) {
                 setLocalEditForm({
                     dept: student.department || '',
@@ -580,93 +363,402 @@ export default function Dashboard() {
                     specialDays: student.specialDays || [],
                     specialTime: student.specialTime || '',
                     startDate: student.startDate || '',
-                    endDate: student.endDate || ''
+                    endDate: student.endDate || '',
                 });
                 setShowSidebarEdit(true);
             }
         } else if (importSelectedIds.size !== 1) {
-            setLocalEditForm({
-                dept: '', name: '', class: '', schoolGrade: '', days: [], time: '',
-                specialDays: [], specialTime: '', startDate: '', endDate: ''
-            });
+            setLocalEditForm({ dept: '', name: '', class: '', schoolGrade: '', days: [], time: '', specialDays: [], specialTime: '', startDate: '', endDate: '' });
         }
     }, [importSelectedIds, activeImportId, importHistory, viewMode]);
 
-    const updateSessionData = (sessionId, path, value) => {
-        setSessions(prev => prev.map(s => {
-            if (s.id === sessionId) {
-                const newSession = JSON.parse(JSON.stringify(s));
-                const keys = path.split('.');
-                let current = newSession;
-                for (let i = 0; i < keys.length - 1; i++) {
-                    current = current[keys[i]];
+    // ───────────────────────────────────────────────────────────────────────
+    // 핸들러
+    // ───────────────────────────────────────────────────────────────────────
+
+    const withSync = useCallback(async (fn) => {
+        setIsSyncing(true);
+        try { await fn(); }
+        catch (e) { console.error(e); }
+        finally { setIsSyncing(false); }
+    }, []);
+
+    const moveDate = (delta) => {
+        setSelectedDate(prev => {
+            const d = new Date(prev);
+            d.setDate(d.getDate() + delta);
+            return d;
+        });
+    };
+
+    const handleInstantStatus = (session, newStatus) =>
+        withSync(async () => {
+            const targetStatus = session.status === newStatus ? 'waiting' : newStatus;
+            const updated = {
+                ...session,
+                status: targetStatus,
+                checks: { ...session.checks, summaryConfirmed: targetStatus === 'attendance' },
+            };
+            setSessions(prev => prev.map(ps => ps.id === session.id ? updated : ps));
+            await sendToGAS(GAS_URL, updated, updated.id);
+        });
+
+    const handleBulkStatusUpdate = (status) =>
+        withSync(async () => {
+            const ids = Array.from(selectedSessionIds);
+            const updated = sessions.map(s => {
+                if (!selectedSessionIds.has(s.id)) return s;
+                return { ...s, status, checks: { ...s.checks, summaryConfirmed: status === 'attendance' } };
+            });
+            setSessions(updated);
+            for (const id of ids) {
+                const s = updated.find(x => x.id === id);
+                if (s) await sendDataToGAS(s);
+            }
+            setSelectedSessionIds(new Set());
+        });
+
+    const handleHomeworkCellUpdate = (session, step, area, value) =>
+        withSync(async () => {
+            const updated = {
+                ...session,
+                checks: {
+                    ...session.checks,
+                    [step]: { ...(session.checks[step] || {}), [area]: value },
+                },
+            };
+            setSessions(prev => prev.map(s => s.id === session.id ? updated : s));
+            await sendToGAS(GAS_URL, updated, updated.id);
+        });
+
+    const handleBulkHomeworkUpdate = (value) =>
+        withSync(async () => {
+            if (selectedHomeworkAreas.size === 0) {
+                toast.warning('적용할 영역(Area)을 하나 이상 선택해주세요.');
+                return;
+            }
+            const ids = Array.from(selectedSessionIds);
+            const prefix = viewMode === 'retention' ? 'retention' : 'homework';
+            const stepMap = { '1st': `${prefix}1`, '2nd': `${prefix}2`, 'next': `${prefix}Next` };
+            const targetStep = stepMap[homeworkSubView] || `${prefix}1`;
+
+            const updated = sessions.map(s => {
+                if (!selectedSessionIds.has(s.id)) return s;
+                const stepData = { ...(s.checks[targetStep] || {}) };
+                if (homeworkSubView !== 'next') {
+                    selectedHomeworkAreas.forEach(area => { stepData[area] = value; });
                 }
-                current[keys[keys.length - 1]] = value;
-                return newSession;
+                return { ...s, checks: { ...s.checks, [targetStep]: stepData } };
+            });
+            setSessions(updated);
+
+            for (const id of ids) {
+                const s = updated.find(x => x.id === id);
+                if (s) await sendDataToGAS(s);
             }
-            return s;
-        }));
+            setSelectedSessionIds(new Set());
+            setSelectedHomeworkAreas(new Set());
+            toast.success('일괄 수정이 완료되었습니다.');
+        });
+
+    const handleBulkMemoUpdate = () =>
+        withSync(async () => {
+            if (!bulkMemo.trim()) return;
+            const ids = Array.from(selectedSessionIds);
+            const newMemoObj = {
+                id: Date.now() + Math.random().toString(36).slice(2),
+                text: bulkMemo,
+                date: new Date().toISOString(),
+            };
+            const updated = sessions.map(s => {
+                if (!selectedSessionIds.has(s.id)) return s;
+                const existing = parseMemos(s.checks?.memos?.toDesk);
+                return {
+                    ...s,
+                    checks: {
+                        ...s.checks,
+                        memos: { ...s.checks?.memos, toDesk: JSON.stringify([...existing, newMemoObj]) },
+                    },
+                };
+            });
+            setSessions(updated);
+            for (const id of ids) {
+                const s = updated.find(x => x.id === id);
+                if (s) await sendDataToGAS(s);
+            }
+            setBulkMemo('');
+            setSelectedSessionIds(new Set());
+            toast.success('선택된 학생들에게 메모가 일괄 적용되었습니다.');
+        });
+
+    const handleDeleteMemo = (studentId, memoId) =>
+        withSync(async () => {
+            const updated = sessions.map(s => {
+                if (s.id !== studentId) return s;
+                const memos = parseMemos(s.checks?.memos?.toDesk);
+                if (!Array.isArray(memos)) return s;
+                const filtered = memos.filter(m => m.id !== memoId);
+                const result = {
+                    ...s,
+                    checks: {
+                        ...s.checks,
+                        memos: { ...s.checks?.memos, toDesk: filtered.length > 0 ? JSON.stringify(filtered) : '' },
+                    },
+                };
+                sendDataToGAS(result);
+                if (activeMemoStudent?.id === s.id) setActiveMemoStudent(result);
+                return result;
+            });
+            setSessions(updated);
+        });
+
+    const handleSubViewUpdate = (subView, masterView = 'coursework') => {
+        setHomeworkSubView(subView);
+        setViewMode(masterView);
     };
 
-    const handleBulkUpdate = (category, item, value) => {
-        if (selectedSessionIds.size === 0) return;
-        setSessions(prev => prev.map(session => {
-            if (selectedSessionIds.has(session.id)) {
-                const newChecks = { ...session.checks };
-                if (item) newChecks[category] = { ...newChecks[category], [item]: value };
-                else newChecks[category] = value;
-                return { ...session, checks: newChecks };
-            }
-            return session;
-        }));
+    const toggleSelection = (id) => {
+        setSelectedSessionIds(prev => {
+            const n = new Set(prev);
+            n.has(id) ? n.delete(id) : n.add(id);
+            return n;
+        });
     };
 
-    const handleBulkAttendanceDays = (day) => {
-        if (selectedSessionIds.size === 0) return;
-        setSessions(prev => prev.map(s => {
-            if (selectedSessionIds.has(s.id)) {
-                const currentDays = s.attendanceDays || [];
-                const newDays = currentDays.includes(day)
-                    ? currentDays.filter(d => d !== day)
-                    : [...currentDays, day];
-                return { ...s, attendanceDays: newDays };
-            }
-            return s;
-        }));
+    const toggleFilter = (type, value) => {
+        setFilters(prev => {
+            const cur = prev[type] || [];
+            const next = cur.includes(value) ? cur.filter(v => v !== value) : [...cur, value];
+            return { ...prev, [type]: next };
+        });
     };
 
+    const clearFilters = () => {
+        setFilters({ departments: [], grades: [], class: 'All', school: 'All' });
+        setIsFilterPinned(false);
+        localStorage.removeItem('impact7_filters');
+        localStorage.setItem('impact7_pinned', 'false');
+    };
+
+    const handleCloudSync = async () => {
+        setIsSyncing(true);
+        try {
+            const { success, count, error } = await sync();
+            if (success) {
+                toast.success(`성공! 구글 시트에서 ${count}명의 명단을 동기화했습니다.`);
+                setViewMode('today');
+            } else if (error) {
+                toast.error('동기화 실패: ' + error);
+            }
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    const fetchCloudTabs = async () => {
+        try {
+            const res = await fetch(`${GAS_URL}?mode=list`);
+            const data = await res.json();
+            if (Array.isArray(data)) setCloudTabs(data);
+        } catch (e) { console.error('Cloud List Failed:', e); }
+    };
+
+    // Import Hub 전용: Cloud 탭 목록을 가져온 뒤 가장 최근 탭을 자동 Clone → 스테이징에 바로 표시
+    const handleImportCloudSync = async () => {
+        setIsSyncing(true);
+        try {
+            // 1. 탭 목록 가져오기
+            const listRes = await fetch(`${GAS_URL}?mode=list`);
+            const tabList = await listRes.json();
+            if (!Array.isArray(tabList) || tabList.length === 0) {
+                toast.error('Cloud에 탭이 없습니다.');
+                return;
+            }
+            setCloudTabs(tabList);
+
+            // 2. 가장 최근(첫 번째) 탭의 데이터를 가져와서 스테이징에 로드
+            const latestTab = tabList[0];
+            const dataRes = await fetch(`${GAS_URL}?sheetName=${latestTab}`);
+            const data = await dataRes.json();
+            if (Array.isArray(data) && data.length > 0) {
+                // 기존 sessions를 Map으로 (이름_반 검색용)
+                const sessionsMap = new Map(sessions.map(s => {
+                    const ns = normalizeSession(s);
+                    return [ns._dedupeKey, ns];
+                }));
+
+                const normalized = data.map(s => {
+                    const ns = normalizeSession(s);
+                    const existing = sessionsMap.get(ns._dedupeKey);
+
+                    if (existing) {
+                        // 기존 DB에 학생이 있으면, DB의 스케줄 + Cloud의 스케줄을 합쳐서 스테이징에 표시
+                        return {
+                            ...ns,
+                            id: existing.id, // ID 유지 (중복 방지)
+                            attendanceDays: Array.from(new Set([...toArray(existing.attendanceDays), ...toArray(ns.attendanceDays)])).filter(Boolean),
+                            specialDays: Array.from(new Set([...toArray(existing.specialDays), ...toArray(ns.specialDays)])).filter(Boolean),
+                            extraDays: Array.from(new Set([...toArray(existing.extraDays), ...toArray(ns.extraDays)])).filter(Boolean),
+                            classes: Array.from(new Set([...toArray(existing.classes), ...toArray(ns.classes)])).filter(Boolean)
+                        };
+                    }
+                    return ns;
+                });
+
+                const newImport = { id: `cloud-${Date.now()}`, name: `Cloud:${latestTab}`, students: normalized, isCommited: false };
+                setImportHistory(prev => [newImport, ...prev]);
+                setActiveImportId(newImport.id);
+                toast.success(`'${latestTab}' 탭 (${normalized.length}명)을 기존 데이터와 병합하여 로드했습니다.`);
+            } else {
+                toast.error(`'${latestTab}' 탭에 데이터가 없습니다.`);
+            }
+        } catch (e) {
+            console.error('Import Cloud Sync Failed:', e);
+            toast.error('Cloud 동기화 실패: ' + e.message);
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+
+    const handleCloneCloudTab = (sheetName) =>
+        withSync(async () => {
+            const res = await fetch(`${GAS_URL}?sheetName=${sheetName}`);
+            const data = await res.json();
+            if (Array.isArray(data)) {
+                // Cloud에서 가져온 데이터도 즉시 정규화하여 스테이징에 보관
+                const normalized = data.map(normalizeSession);
+                const newImport = { id: `cloud-${Date.now()}`, name: `Cloud:${sheetName}`, students: normalized, isCommited: false };
+                setImportHistory(prev => [newImport, ...prev]);
+                setActiveImportId(newImport.id);
+                toast.success(`'${sheetName}' 탭 데이터를 스테이징으로 가져왔습니다.`);
+            }
+        });
+
+    const handleCreateSessions = async (students) => {
+        const now = new Date();
+        const pad = (n, l = 2) => String(n).padStart(l, '0');
+        const sheetName = [
+            String(now.getFullYear()).slice(-2),
+            pad(now.getMonth() + 1), pad(now.getDate()),
+            pad(now.getHours()), pad(now.getMinutes()),
+        ].join('');
+
+        const formatted = students.map(s => ({
+            ...s,
+            payloadHeader: `| ${s.department} | ${s.name} | ${s.classes?.[0]} | ${s.schoolName} ${s.grade} |`,
+        }));
+
+        const success = await sendDataToGAS({ type: 'bulk_import', students: formatted, sheetName });
+        if (success) {
+            toast.success(`${formatted.length}명의 데이터가 '${sheetName}' 탭으로 전송되었습니다.`);
+            setImportHistory(prev => prev.map(h =>
+                h.students[0]?.name === students[0]?.name ? { ...h, isCommited: true } : h
+            ));
+        }
+
+        setSessions(prev => {
+            // 기존 세션들을 Map으로 구성 (병합 효율성)
+            // normalizeSession을 통해 생성된 _dedupeKey를 매칭 키로 사용
+            const map = new Map(prev.map(s => {
+                const ns = normalizeSession(s);
+                return [ns._dedupeKey, ns];
+            }));
+
+            let mergedCount = 0, addedCount = 0;
+            formatted.forEach(s => {
+                const ns = normalizeSession(s); // 신규 임포트 데이터 정규화
+                const key = ns._dedupeKey;
+
+                if (map.has(key)) {
+                    mergedCount++;
+                    // 기존 데이터가 있으면 정보 및 스케줄만 선별적으로 업데이트 (상태/체크 유실 방지)
+                    const existing = map.get(key);
+                    const merged = {
+                        ...existing,
+                        department: ns.department || existing.department,
+                        schoolName: ns.schoolName || existing.schoolName,
+                        grade: ns.grade || existing.grade,
+                        // 요일 데이터는 덮어쓰지 않고 '합치기' (Set 이용 중복 제거)
+                        attendanceDays: Array.from(new Set([...toArray(existing.attendanceDays), ...toArray(ns.attendanceDays)])).filter(Boolean),
+                        attendanceTime: ns.attendanceTime || existing.attendanceTime,
+                        specialDays: Array.from(new Set([...toArray(existing.specialDays), ...toArray(ns.specialDays)])).filter(Boolean),
+                        specialTime: ns.specialTime || existing.specialTime,
+                        extraDays: Array.from(new Set([...toArray(existing.extraDays), ...toArray(ns.extraDays)])).filter(Boolean),
+                        classes: Array.from(new Set([...toArray(existing.classes), ...toArray(ns.classes)])).filter(Boolean)
+                    };
+                    // 스케줄 변경 추적 로그
+                    const scheduleChanged =
+                        JSON.stringify(merged.attendanceDays) !== JSON.stringify(existing.attendanceDays) ||
+                        JSON.stringify(merged.specialDays) !== JSON.stringify(existing.specialDays) ||
+                        JSON.stringify(merged.extraDays) !== JSON.stringify(existing.extraDays);
+                    if (scheduleChanged) {
+                        console.log(`[Commit 병합] ${ns.name}: 정규 ${JSON.stringify(existing.attendanceDays)}→${JSON.stringify(merged.attendanceDays)}, 특강 ${JSON.stringify(existing.specialDays)}→${JSON.stringify(merged.specialDays)}, 임의 ${JSON.stringify(existing.extraDays)}→${JSON.stringify(merged.extraDays)}`);
+                    }
+                    map.set(key, merged);
+                } else {
+                    addedCount++;
+                    map.set(key, ns);
+                }
+            });
+            console.log(`[Commit 완료] 병합: ${mergedCount}명, 신규추가: ${addedCount}명, 총: ${map.size}명`);
+            return Array.from(map.values());
+        });
+
+        return success;
+    };
+
+    const handleUpdateStudent = (updatedStudent) => {
+        setSessions(prev => prev.map(s => s.id === updatedStudent.id ? updatedStudent : s));
+        setImportHistory(prev => prev.map(h => ({
+            ...h,
+            students: h.students.map(s => s.id === updatedStudent.id ? updatedStudent : s)
+        })));
+        setActiveProfileStudent(updatedStudent);
+        sendToGAS(GAS_URL, updatedStudent, updatedStudent.id);
+    };
 
     const handleIndividualAdd = (studentData) => {
-        const newStudent = createBlankSession(studentData);
+        const newStudent = normalizeSession(createBlankSession(studentData));
         if (activeImportId) {
-            setImportHistory(prev => prev.map(h => h.id === activeImportId ? { ...h, students: [newStudent, ...h.students] } : h));
+            setImportHistory(prev => prev.map(h =>
+                h.id === activeImportId ? { ...h, students: [newStudent, ...h.students] } : h
+            ));
         } else {
-            const now = new Date();
-            const sessionName = `Manual Entry: ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
-            const newImport = { id: Date.now().toString(), name: sessionName, students: [newStudent] };
+            const newImport = {
+                id: Date.now().toString(),
+                name: `Manual Entry: ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+                students: [newStudent],
+            };
             setImportHistory(prev => [newImport, ...prev]);
             setActiveImportId(newImport.id);
         }
     };
+
+    const handleUpdateStagingStudents = (updates) => {
+        if (!activeImportId) return;
+        setImportHistory(prev => prev.map(h => {
+            if (h.id !== activeImportId) return h;
+            return { ...h, students: h.students.map(st => importSelectedIds.has(st.id) ? { ...st, ...updates } : st) };
+        }));
+    };
+
     const handleApplyRegularSchedule = () => {
         if (!activeImportId) return;
-        const finalTargetIds = importSelectedIds.size > 0
-            ? importSelectedIds
-            : new Set(stagedFilteredStudents.map(s => s.id));
+        const currentImport = importHistory.find(h => h.id === activeImportId);
+        if (!currentImport) return;
 
+        const targets = importSelectedIds.size > 0 ? importSelectedIds : new Set(stagedFilteredStudents.map(s => s.id));
         setImportHistory(prev => prev.map(h => {
             if (h.id !== activeImportId) return h;
             return {
-                ...h,
-                students: h.students.map(st => {
-                    if (finalTargetIds.has(st.id)) {
-                        return {
-                            ...st,
-                            attendanceDays: importBatchDays.length > 0 ? [...importBatchDays] : st.attendanceDays,
-                            attendanceTime: importBatchTime || st.attendanceTime
-                        };
-                    }
-                    return st;
+                ...h, students: h.students.map(st => {
+                    if (!targets.has(st.id)) return st;
+                    return {
+                        ...st,
+                        attendanceDays: importBatchDays.length > 0 ? [...importBatchDays] : st.attendanceDays,
+                        attendanceTime: importBatchTime || st.attendanceTime,
+                    };
                 })
             };
         }));
@@ -679,29 +771,25 @@ export default function Dashboard() {
 
     const handleApplySpecialSchedule = () => {
         if (!activeImportId) return;
-        const finalTargetIds = importSelectedIds.size > 0
-            ? importSelectedIds
-            : new Set(stagedFilteredStudents.map(s => s.id));
+        const currentImport = importHistory.find(h => h.id === activeImportId);
+        if (!currentImport) return;
 
+        const targets = importSelectedIds.size > 0 ? importSelectedIds : new Set(stagedFilteredStudents.map(s => s.id));
         setImportHistory(prev => prev.map(h => {
             if (h.id !== activeImportId) return h;
             return {
-                ...h,
-                students: h.students.map(st => {
-                    if (finalTargetIds.has(st.id)) {
-                        return {
-                            ...st,
-                            specialDays: importSpecialBatchDays.length > 0 ? [...importSpecialBatchDays] : st.specialDays,
-                            specialTime: importSpecialBatchTime || st.specialTime,
-                            startDate: importBatchStartDate || st.startDate,
-                            endDate: importBatchEndDate || st.endDate
-                        };
-                    }
-                    return st;
+                ...h, students: h.students.map(st => {
+                    if (!targets.has(st.id)) return st;
+                    return {
+                        ...st,
+                        specialDays: importSpecialBatchDays.length > 0 ? [...importSpecialBatchDays] : st.specialDays,
+                        specialTime: importSpecialBatchTime || st.specialTime,
+                        startDate: importBatchStartDate || st.startDate,
+                        endDate: importBatchEndDate || st.endDate,
+                    };
                 })
             };
         }));
-
         setImportSpecialBatchDays([]);
         setImportSpecialBatchTime('');
         setImportBatchStartDate('');
@@ -710,206 +798,47 @@ export default function Dashboard() {
         if (importSelectedIds.size > 0) setImportSelectedIds(new Set());
     };
 
-    const handleUpdateStagingStudents = (updates) => {
+    const handleApplyArbitrarySchedule = () => {
         if (!activeImportId) return;
+        const currentImport = importHistory.find(h => h.id === activeImportId);
+        if (!currentImport) return;
+
+        const targets = importSelectedIds.size > 0 ? importSelectedIds : new Set(stagedFilteredStudents.map(s => s.id));
         setImportHistory(prev => prev.map(h => {
             if (h.id !== activeImportId) return h;
             return {
-                ...h,
-                students: h.students.map(st => {
-                    if (importSelectedIds.has(st.id)) {
-                        return { ...st, ...updates };
-                    }
-                    return st;
+                ...h, students: h.students.map(st => {
+                    if (!targets.has(st.id)) return st;
+                    return {
+                        ...st,
+                        extraDays: importArbitraryBatchDays.length > 0 ? [...importArbitraryBatchDays] : st.extraDays,
+                    };
                 })
             };
         }));
+        setImportArbitraryBatchDays([]);
+        setImportSearchQuery('');
+        if (importSelectedIds.size > 0) setImportSelectedIds(new Set());
     };
 
-    const handleCloudSync = async () => {
-        setIsSyncing(true);
-        try {
-            const URL = "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec";
-            const response = await fetch(URL);
-            const data = await response.json();
-            if (data && Array.isArray(data)) {
-                setSessions(data);
-                alert(`성공! 구글 시트에서 ${data.length}명의 명단을 동기화했습니다.`);
-                setViewMode('today');
-            }
-        } catch (error) {
-            console.error("Sync failed:", error);
-            alert("동기화 중 오류가 발생했습니다: " + error.message);
-        } finally {
-            setIsSyncing(false);
-        }
+    const addTask = () => setDeferTasks(t => [...t, '']);
+    const removeTask = (i) => setDeferTasks(t => t.length > 1 ? t.filter((_, idx) => idx !== i) : ['']);
+
+    const togglePanel = (panel) => {
+        setShowSidebarEdit(panel === 'edit');
+        setShowSidebarAdd(panel === 'add');
+        setShowExcelBridge(panel === 'excel');
+        setShowHistory(panel === 'history');
     };
 
-    const fetchCloudTabs = async () => {
-        try {
-            const URL = "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec?mode=list";
-            const response = await fetch(URL);
-            const data = await response.json();
-            if (Array.isArray(data)) setCloudTabs(data);
-        } catch (err) {
-            console.error("Cloud List Failed:", err);
-        }
-    };
-
-    const handleCloneCloudTab = async (sheetName) => {
-        setIsSyncing(true);
-        try {
-            const URL = `https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec?sheetName=${sheetName}`;
-            const response = await fetch(URL);
-            const data = await response.json();
-
-            if (data && Array.isArray(data)) {
-                const newImport = {
-                    id: `cloud-${Date.now()}`,
-                    name: `Cloud:${sheetName}`,
-                    students: data,
-                    isCommited: false
-                };
-                setImportHistory(prev => [newImport, ...prev]);
-                setActiveImportId(newImport.id);
-                alert(`'${sheetName}' 탭 데이터를 스테이징으로 가져왔습니다. 'Commit'을 누르면 현재 시간으로 복제됩니다.`);
-            }
-        } catch (error) {
-            alert("불러오기 실패: " + error.message);
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const handleCreateSessions = async (students) => {
-        const now = new Date();
-        const yy = String(now.getFullYear()).slice(-2);
-        const mm = String(now.getMonth() + 1).padStart(2, '0');
-        const dd = String(now.getDate()).padStart(2, '0');
-        const hh = String(now.getHours()).padStart(2, '0');
-        const mi = String(now.getMinutes()).padStart(2, '0');
-        const targetSheetName = `${yy}${mm}${dd}${hh}${mi}`;
-
-        const formattedStudents = students.map(s => ({
-            ...s,
-            payloadHeader: `| ${s.department} | ${s.name} | ${s.classes?.[0]} | ${s.schoolName} ${s.grade} |`
-        }));
-
-        // Sync to GAS
-        const GAS_URL = "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec";
-        const success = await sendDataToGAS({
-            type: 'bulk_import',
-            students: formattedStudents,
-            sheetName: targetSheetName
-        }, GAS_URL);
-
-        if (success) {
-            alert(`${formattedStudents.length}명의 데이터가 '${targetSheetName}' 탭으로 성공적으로 전송되었습니다.`);
-
-            // 전송 성공 후에도 히스토리 보존 (isCommited 플래그만 업데이트)
-            setImportHistory(prev => prev.map(h => {
-                const isThisOne = h.students.length === students.length && h.students[0]?.name === students[0]?.name;
-                return isThisOne ? { ...h, isCommited: true } : h;
-            }));
-        }
-
-        setSessions(prev => {
-            const existingMap = new Map();
-            prev.forEach(ps => {
-                const key = `${ps.name}-${ps.classes?.[0]}`;
-                existingMap.set(key, ps);
-            });
-
-            formattedStudents.forEach(ns => {
-                const key = `${ns.name}-${ns.classes?.[0]}`;
-                if (!existingMap.has(key)) {
-                    existingMap.set(key, ns);
-                }
-            });
-
-            return Array.from(existingMap.values());
-        });
-
-        return success;
-    };
-
-    const sendDataToGAS = async (data, targetUrl) => {
-        setIsSyncing(true);
-        try {
-            const payload = {
-                date: data.date || new Date().toISOString().split('T')[0],
-                timestamp: new Date().toISOString(),
-                ...data
-            };
-
-            // no-cors는 성공 여부를 알 수 없으므로, 최대한 전송을 시도합니다.
-            // 만약 구글 시트에서 CORS 에러가 나더라도 데이터는 전달될 수 있습니다.
-            await fetch(targetUrl, {
-                method: 'POST',
-                mode: 'no-cors',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            return true;
-        } catch (error) {
-            console.error("Link failed:", error);
-            alert("전송 중 오류가 발생했습니다: " + error.message);
-            return false;
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const handleCheckout = async (session) => {
-        setIsSyncing(true);
-        try {
-            const updatedSession = JSON.parse(JSON.stringify(session));
-            updatedSession.status = 'attendance';
-            updatedSession.checks.summaryConfirmed = true;
-            await sendDataToGAS(updatedSession, "https://script.google.com/macros/s/AKfycbzj9U17izH6L6pjvIgapyxHfFiLQLB9WqbQ0umTVa972ZWbSYXFWiHiBknLpqrP924o/exec");
-            setSessions(prev => prev.map(s => s.id === session.id ? updatedSession : s));
-            setShowDetailPanel(false);
-        } catch (error) {
-            console.error("Checkout failed:", error);
-        } finally {
-            setIsSyncing(false);
-        }
-    };
-
-    const generateLMS = (session) => {
-        if (!session) return "";
-        let message = `[IMPACT7 English] ${session.name} Report\n\n`;
-        message += `■ Status: ${session.status.toUpperCase()}\n\n`;
-        const statusMap = { 'o': '●', 'triangle': '▲', 'x': '×' };
-        const categories = [
-            { key: 'basic', label: 'Basic Checks' },
-            { key: 'homework', label: 'Homework Status' },
-            { key: 'review', label: 'Review Test' }
-        ];
-        categories.forEach(cat => {
-            const items = Object.entries(session.checks[cat.key])
-                .filter(([_, val]) => val !== 'none')
-                .map(([key, val]) => `- ${key.toUpperCase()}: ${statusMap[val] || val}`)
-                .join('\n');
-            if (items) message += `■ ${cat.label}\n${items}\n\n`;
-        });
-        const nextHw = Object.entries(session.checks.nextHomework)
-            .filter(([_, val]) => val.trim() !== "")
-            .map(([key, val]) => `- ${key.toUpperCase()}: ${val}`)
-            .join("\n");
-        if (nextHw) message += `■ Next Homework\n${nextHw}\n\n`;
-        if (session.checks.memos.toParent.trim()) message += `■ Memo\n${session.checks.memos.toParent}\n\n`;
-        message += `Writer: ${session.lastEditedBy}`;
-        return message;
-    };
-
-    const copyToClipboard = (text) => navigator.clipboard.writeText(text);
-
-    const activeSession = currentSessionId ? sessions.find(s => s.id === currentSessionId) : null;
+    // ───────────────────────────────────────────────────────────────────────
+    // 렌더
+    // ───────────────────────────────────────────────────────────────────────
 
     return (
         <div className="flex h-screen bg-background text-foreground font-sans antialiased overflow-hidden">
-            {/* Sidebar Logic */}
+
+            {/* ── 사이드바 (일반 뷰) ── */}
             {viewMode !== 'import' && (
                 <aside className="w-[240px] border-r border-border bg-white flex flex-col shrink-0">
                     <div className="px-4 py-3">
@@ -918,7 +847,9 @@ export default function Dashboard() {
                                 <div className="w-6 h-6 rounded-md bg-black flex items-center justify-center shrink-0">
                                     <span className="text-white font-black text-[10px]">I7</span>
                                 </div>
-                                <span className="font-bold text-sm tracking-tight truncate text-foreground">IMPACT7 <span className="text-muted-foreground font-medium">Workstation</span></span>
+                                <span className="font-bold text-sm tracking-tight truncate text-foreground">
+                                    IMPACT7 <span className="text-muted-foreground font-medium">Workstation</span>
+                                </span>
                             </div>
                             <ChevronDown size={14} className="text-muted-foreground group-hover:text-foreground shrink-0" />
                         </div>
@@ -926,155 +857,93 @@ export default function Dashboard() {
 
                     <nav className="px-3 space-y-0.5 mb-6">
                         <NavItem icon={<Bell size={16} />} label="Notifications" />
-                        <NavItem icon={<CheckSquare size={16} />} label="Tasks" />
                         <NavItem icon={<FileText size={16} />} label="Notes" />
                         <NavItem icon={<Database size={16} />} label="Server Sync" onClick={handleCloudSync} />
                     </nav>
 
                     <div className="px-3 mb-2">
-                        <p className="px-3 py-1 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest flex items-center justify-between group">
+                        <p className="px-3 py-1 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest">
                             Student Selection
                         </p>
                     </div>
 
+                    {/* 검색 결과 미니 리스트 */}
                     <div className="px-4 mb-4">
-                        <div className="space-y-2">
-                            {sidebarFilteredStudents.length > 0 ? (
-                                <div className="max-h-52 overflow-y-auto border border-border rounded-lg bg-muted/20 divide-y divide-border/50 scrollbar-hide py-1 shadow-inner">
-                                    {sidebarFilteredStudents.map(s => (
-                                        <div
-                                            key={s.id}
-                                            onClick={() => toggleSidebarSelection(s.id)}
-                                            className={`px-2.5 py-1.5 flex items-center gap-2 cursor-pointer hover:bg-white transition-colors ${sidebarSelectedIds.has(s.id) ? 'bg-white' : ''}`}
-                                        >
-                                            <input type="checkbox" checked={sidebarSelectedIds.has(s.id)} onChange={() => { }} className="w-3.5 h-3.5 rounded accent-black" />
-                                            <div className="min-w-0 flex-1 flex flex-col -space-y-0.5">
-                                                <div className="flex items-center gap-1.5">
-                                                    <span className="text-[11px] font-bold truncate leading-tight">{s.name}</span>
-                                                    {s.checks?.memos?.toDesk && (
-                                                        <MessageSquare
-                                                            size={10}
-                                                            className="text-indigo-500 fill-indigo-500/20 shrink-0 cursor-pointer"
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                setActiveMemoStudent(s);
-                                                                setShowMemoModal(true);
-                                                            }}
-                                                        />
-                                                    )}
-                                                </div>
-                                                <span className="text-[9px] text-muted-foreground truncate leading-tight">{s.classes?.[0] || s.grade}</span>
+                        {sidebarFilteredStudents.length > 0 && (
+                            <div className="max-h-52 overflow-y-auto border border-border rounded-lg bg-muted/20 divide-y divide-border/50 scrollbar-hide py-1 shadow-inner">
+                                {sidebarFilteredStudents.map(s => (
+                                    <div key={s.id}
+                                        className="px-2.5 py-1.5 flex items-center gap-2 cursor-pointer hover:bg-white transition-colors">
+                                        <div className="min-w-0 flex-1 flex flex-col -space-y-0.5">
+                                            <div className="flex items-center gap-1.5">
+                                                <span className="text-[11px] font-bold truncate leading-tight">{s.name}</span>
+                                                {s.checks?.memos?.toDesk && (
+                                                    <MessageSquare size={10}
+                                                        className="text-indigo-500 fill-indigo-500/20 shrink-0 cursor-pointer"
+                                                        onClick={(e) => { e.stopPropagation(); setActiveMemoStudent(s); setShowMemoModal(true); }} />
+                                                )}
                                             </div>
+                                            <span className="text-[9px] text-muted-foreground truncate leading-tight">
+                                                {s.classes?.[0] || s.grade}
+                                            </span>
                                         </div>
-                                    ))}
-                                </div>
-                            ) : null}
-                            {sidebarSelectedIds.size > 0 && (
-                                <div className="flex items-center justify-between px-1">
-                                    <span className="text-[10px] font-bold text-primary">{sidebarSelectedIds.size} selected</span>
-                                    <button onClick={() => setSidebarSelectedIds(new Set())} className="text-[10px] font-bold text-muted-foreground hover:text-foreground">Clear</button>
-                                </div>
-                            )}
-                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
 
                     <div className="flex-1 overflow-y-auto px-3 space-y-0.5 scrollbar-hide pb-20">
                         <NavItem icon={<Clock size={16} />} label="Attendance" active={viewMode === 'today'} onClick={() => setViewMode('today')} />
 
-                        <div>
-                            <NavItem
-                                icon={<Users size={16} />}
-                                label="Coursework"
-                                active={viewMode === 'coursework' && !homeworkSubView}
-                                onClick={() => {
-                                    if (viewMode === 'coursework' && !homeworkSubView) {
-                                        setIsHomeworkExpanded(!isHomeworkExpanded);
-                                    } else {
-                                        setViewMode('coursework');
-                                        setHomeworkSubView(null);
-                                        setIsHomeworkExpanded(true);
-                                    }
-                                }}
-                                hasDropdown
-                                isExpanded={isHomeworkExpanded}
-                            />
-                            {isHomeworkExpanded && (
-                                <div className="pl-9 space-y-0.5 mt-0.5 mb-2 animate-in slide-in-from-left-2 duration-200">
-                                    <div
-                                        onClick={() => handleSubViewUpdate('1st', 'coursework')}
-                                        className={`px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer transition-all ${viewMode === 'coursework' && homeworkSubView === '1st' ? 'bg-black text-white' : 'text-zinc-400 hover:text-black hover:bg-zinc-50'}`}
-                                    >
-                                        1st Check
-                                    </div>
-                                    <div
-                                        onClick={() => handleSubViewUpdate('2nd', 'coursework')}
-                                        className={`px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer transition-all ${viewMode === 'coursework' && homeworkSubView === '2nd' ? 'bg-black text-white' : 'text-zinc-400 hover:text-black hover:bg-zinc-50'}`}
-                                    >
-                                        2nd Check
-                                    </div>
-                                    <div
-                                        onClick={() => handleSubViewUpdate('next', 'coursework')}
-                                        className={`px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer transition-all ${viewMode === 'coursework' && homeworkSubView === 'next' ? 'bg-black text-white' : 'text-zinc-400 hover:text-black hover:bg-zinc-50'}`}
-                                    >
-                                        Next Coursework
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-
-                        <div>
-                            <NavItem
-                                icon={<Zap size={16} />}
-                                label="Retention"
-                                active={viewMode === 'retention' && !homeworkSubView}
-                                onClick={() => {
-                                    if (viewMode === 'retention' && !homeworkSubView) {
-                                        setIsRetentionExpanded(!isRetentionExpanded);
-                                    } else {
-                                        setViewMode('retention');
-                                        setHomeworkSubView(null);
-                                        setIsRetentionExpanded(true);
-                                    }
-                                }}
-                                hasDropdown
-                                isExpanded={isRetentionExpanded}
-                            />
-                            {isRetentionExpanded && (
-                                <div className="pl-9 space-y-0.5 mt-0.5 mb-2 animate-in slide-in-from-left-2 duration-200">
-                                    <div
-                                        onClick={() => handleSubViewUpdate('1st', 'retention')}
-                                        className={`px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer transition-all ${viewMode === 'retention' && homeworkSubView === '1st' ? 'bg-black text-white' : 'text-zinc-400 hover:text-black hover:bg-zinc-50'}`}
-                                    >
-                                        1st Trial
-                                    </div>
-                                    <div
-                                        onClick={() => handleSubViewUpdate('2nd', 'retention')}
-                                        className={`px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer transition-all ${viewMode === 'retention' && homeworkSubView === '2nd' ? 'bg-black text-white' : 'text-zinc-400 hover:text-black hover:bg-zinc-50'}`}
-                                    >
-                                        2nd Trial
-                                    </div>
-                                    <div
-                                        onClick={() => handleSubViewUpdate('next', 'retention')}
-                                        className={`px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer transition-all ${viewMode === 'retention' && homeworkSubView === 'next' ? 'bg-black text-white' : 'text-zinc-400 hover:text-black hover:bg-zinc-50'}`}
-                                    >
-                                        Next Trial
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-
-                        <NavItem icon={<Zap size={16} />} label="Automations" />
-
-                        {(viewMode === 'coursework' || viewMode === 'retention') && (
-                            <div className="mt-6 pt-6 border-t border-border space-y-4 px-1">
-                                <p className="px-2 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest">Active Filters</p>
-                                <div className="space-y-2">
-                                    <FilterSelect label="Class" value={filters.class} options={filterOptions.classes} onChange={v => setFilters({ ...filters, class: v })} />
-                                    <FilterSelect label="School" value={filters.school} options={filterOptions.schools} onChange={v => setFilters({ ...filters, school: v })} />
-                                </div>
+                        {/* Coursework */}
+                        <NavItem icon={<Users size={16} />} label="Coursework"
+                            active={viewMode === 'coursework' && !homeworkSubView}
+                            hasDropdown isExpanded={isHomeworkExpanded}
+                            onClick={() => {
+                                if (viewMode === 'coursework' && !homeworkSubView) setIsHomeworkExpanded(p => !p);
+                                else { setViewMode('coursework'); setHomeworkSubView(null); setIsHomeworkExpanded(true); }
+                            }} />
+                        {isHomeworkExpanded && (
+                            <div className="pl-9 space-y-0.5 mt-0.5 mb-2">
+                                {[['1st', '1st Check'], ['2nd', '2nd Check'], ['next', 'Next Coursework']].map(([key, label]) => (
+                                    <SubNavItem key={key} label={label}
+                                        active={viewMode === 'coursework' && homeworkSubView === key}
+                                        onClick={() => handleSubViewUpdate(key, 'coursework')} />
+                                ))}
                             </div>
                         )}
 
+                        {/* Retention */}
+                        <NavItem icon={<Zap size={16} />} label="Retention"
+                            active={viewMode === 'retention' && !homeworkSubView}
+                            hasDropdown isExpanded={isRetentionExpanded}
+                            onClick={() => {
+                                if (viewMode === 'retention' && !homeworkSubView) setIsRetentionExpanded(p => !p);
+                                else { setViewMode('retention'); setHomeworkSubView(null); setIsRetentionExpanded(true); }
+                            }} />
+                        {isRetentionExpanded && (
+                            <div className="pl-9 space-y-0.5 mt-0.5 mb-2">
+                                {[['1st', '1st Trial'], ['2nd', '2nd Trial'], ['next', 'Next Trial']].map(([key, label]) => (
+                                    <SubNavItem key={key} label={label}
+                                        active={viewMode === 'retention' && homeworkSubView === key}
+                                        onClick={() => handleSubViewUpdate(key, 'retention')} />
+                                ))}
+                            </div>
+                        )}
+
+                        <NavItem icon={<Zap size={16} />} label="Automations" />
+
+                        {/* Active Filters */}
+                        {['coursework', 'retention'].includes(viewMode) && (
+                            <div className="mt-6 pt-6 border-t border-border space-y-4 px-1">
+                                <p className="px-2 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest">Active Filters</p>
+                                <FilterSelect label="Class" value={filters.class} options={filterOptions.classes} onChange={v => setFilters(f => ({ ...f, class: v }))} />
+                                <FilterSelect label="School" value={filters.school} options={filterOptions.schools} onChange={v => setFilters(f => ({ ...f, school: v }))} />
+                            </div>
+                        )}
+
+                        {/* Task Deferral */}
                         <div className="mt-8 pt-8 border-t border-border px-1">
                             <p className="px-2 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest mb-4">Task Deferral</p>
                             <div className="space-y-4">
@@ -1085,13 +954,17 @@ export default function Dashboard() {
                                 <div className="space-y-1.5">
                                     {deferTasks.map((task, idx) => (
                                         <div key={idx} className="flex gap-1.5 group">
-                                            <SidebarInput placeholder={`Task ${idx + 1}`} value={task} onChange={e => { const nt = [...deferTasks]; nt[idx] = e.target.value; setDeferTasks(nt); }} />
-                                            <button onClick={() => removeTask(idx)} className="opacity-0 group-hover:opacity-100 p-1 text-muted-foreground hover:text-destructive transition-all"><X size={12} /></button>
+                                            <SidebarInput placeholder={`Task ${idx + 1}`} value={task}
+                                                onChange={e => { const nt = [...deferTasks]; nt[idx] = e.target.value; setDeferTasks(nt); }} />
+                                            <button onClick={() => removeTask(idx)}
+                                                className="opacity-0 group-hover:opacity-100 p-1 text-muted-foreground hover:text-destructive transition-all">
+                                                <X size={12} />
+                                            </button>
                                         </div>
                                     ))}
-                                    <button onClick={addTask} className="text-[10px] font-bold text-primary hover:text-primary/70 Transition-colors">+ Add more</button>
+                                    <button onClick={addTask} className="text-[10px] font-bold text-primary hover:text-primary/70 transition-colors">+ Add more</button>
                                 </div>
-                                <button className="w-full h-9 bg-black text-white rounded-md text-[11px] font-bold hover:bg-zinc-800 transition-all disabled:opacity-50">
+                                <button className="w-full h-9 bg-black text-white rounded-md text-[11px] font-bold hover:bg-zinc-800 transition-all">
                                     {isSyncing ? <Loader2 size={12} className="animate-spin inline mr-2" /> : <Plus size={12} className="inline mr-2" />}
                                     Defer Tasks
                                 </button>
@@ -1101,6 +974,7 @@ export default function Dashboard() {
                 </aside>
             )}
 
+            {/* ── 사이드바 (Import 뷰) ── */}
             {viewMode === 'import' && (
                 <aside className="w-[280px] border-r border-border bg-white flex flex-col shrink-0">
                     <div className="p-5 border-b border-border bg-zinc-50/50">
@@ -1111,499 +985,302 @@ export default function Dashboard() {
                             <h2 className="font-black text-sm tracking-tight uppercase">Import Hub</h2>
                         </div>
 
-                        <button
-                            onClick={handleCloudSync}
-                            disabled={isSyncing}
-                            className="w-full h-11 mb-6 bg-gradient-to-br from-indigo-600 to-violet-700 hover:from-indigo-700 hover:to-violet-800 text-white rounded-xl flex items-center justify-center gap-3 shadow-lg shadow-indigo-200 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 group overflow-hidden relative"
-                        >
-                            <div className="absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-opacity" />
+                        <button onClick={handleImportCloudSync} disabled={isSyncing}
+                            className="w-full h-11 mb-6 bg-gradient-to-br from-indigo-600 to-violet-700 hover:from-indigo-700 hover:to-violet-800 text-white rounded-xl flex items-center justify-center gap-3 shadow-lg shadow-indigo-200 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50">
                             {isSyncing ? <Loader2 size={16} className="animate-spin" /> : <DownloadCloud size={16} />}
                             <span className="font-black text-[11px] uppercase tracking-wider">Cloud Sync</span>
                         </button>
 
                         <div className="space-y-4">
-                            <div className={`group rounded-xl transition-all duration-200 overflow-hidden ${showSidebarEdit ? 'bg-zinc-50' : 'hover:bg-zinc-50'}`}>
-                                <button
-                                    onClick={() => { setShowSidebarEdit(!showSidebarEdit); if (!showSidebarEdit) { setShowSidebarAdd(false); setShowExcelBridge(false); setShowHistory(false); } }}
-                                    className="w-full h-11 flex items-center justify-between px-4 py-3 text-left bg-transparent hover:bg-zinc-50/50 transition-colors"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <div className={`w-7 h-7 rounded-md flex items-center justify-center transition-colors ${showSidebarEdit ? 'bg-black text-white' : 'text-zinc-400 group-hover:text-black'}`}>
-                                            <Layers size={14} />
-                                        </div>
-                                        <span className={`text-[12px] font-bold transition-colors ${showSidebarEdit ? 'text-black' : 'text-zinc-500 group-hover:text-black'}`}>Information Edit</span>
-                                    </div>
-                                    <ChevronDown size={14} className={`text-zinc-300 transition-transform duration-300 ${showSidebarEdit ? 'rotate-180 text-black' : 'group-hover:text-zinc-500'}`} />
-                                </button>
-
-                                {showSidebarEdit && (
-                                    importSelectedIds.size > 0 ? (
-                                        <div className="p-4 border-t border-zinc-100 bg-zinc-50/30 space-y-4 animate-in slide-in-from-top-1 duration-200">
-                                            <div className="flex items-center justify-between mb-1">
-                                                <span className="text-[10px] font-bold text-black uppercase tracking-wide bg-zinc-200 px-2 py-0.5 rounded-full">{importSelectedIds.size} SELECTED</span>
-                                            </div>
-                                            <div className="space-y-3">
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">소속</label>
-                                                    <select
-                                                        className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                        value={localEditForm.dept}
-                                                        onChange={(e) => {
-                                                            const val = e.target.value;
-                                                            setLocalEditForm({ ...localEditForm, dept: val });
-                                                            handleUpdateStagingStudents({ department: val });
-                                                        }}
-                                                    >
-                                                        <option value="">소속 선택...</option>
-                                                        <option value="2단지">2단지</option>
-                                                        <option value="10단지">10단지</option>
-                                                        <option value="기타">기타</option>
-                                                    </select>
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">상태 변경</label>
-                                                    <select
-                                                        className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                        onChange={(e) => {
-                                                            const val = e.target.value;
-                                                            if (val) {
-                                                                handleUpdateStagingStudents({ statusChange: val });
-                                                            }
-                                                        }}
-                                                    >
-                                                        <option value="">상태 변경 선택...</option>
-                                                        <option value="재원→휴원">재원 → 휴원</option>
-                                                        <option value="재원→퇴원">재원 → 퇴원</option>
-                                                        <option value="휴원→재원">휴원 → 재원</option>
-                                                        <option value="휴원→퇴원">휴원 → 퇴원</option>
-                                                    </select>
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">반명</label>
-                                                    <input
-                                                        className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                        value={localEditForm.class}
-                                                        onChange={(e) => setLocalEditForm({ ...localEditForm, class: e.target.value })}
-                                                        onKeyDown={(e) => {
-                                                            if (e.key === 'Enter') handleUpdateStagingStudents({ classes: [localEditForm.class] });
-                                                        }}
-                                                    />
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">학교학년</label>
-                                                    <input
-                                                        className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                        value={localEditForm.schoolGrade}
-                                                        onChange={(e) => setLocalEditForm({ ...localEditForm, schoolGrade: e.target.value })}
-                                                        onKeyDown={(e) => {
-                                                            if (e.key === 'Enter') {
-                                                                const parts = localEditForm.schoolGrade.split(' ');
-                                                                handleUpdateStagingStudents({
-                                                                    schoolName: parts[0] || "",
-                                                                    grade: parts.slice(1).join(' ') || ""
-                                                                });
-                                                            }
-                                                        }}
-                                                    />
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">정규요일</label>
-                                                    <DayPicker selectedDays={localEditForm.days || []} onToggle={(d) => {
-                                                        const newDays = localEditForm.days.includes(d)
-                                                            ? localEditForm.days.filter(x => x !== d)
-                                                            : [...localEditForm.days, d];
-                                                        setLocalEditForm({ ...localEditForm, days: newDays });
-                                                    }} />
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">정규시간</label>
-                                                    <input
-                                                        type="time"
-                                                        className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                        value={localEditForm.time || ''}
-                                                        onChange={(e) => setLocalEditForm({ ...localEditForm, time: e.target.value })}
-                                                    />
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">특강요일선택</label>
-                                                    <DayPicker selectedDays={localEditForm.specialDays || []} onToggle={(d) => {
-                                                        const newDays = localEditForm.specialDays.includes(d)
-                                                            ? localEditForm.specialDays.filter(x => x !== d)
-                                                            : [...localEditForm.specialDays, d];
-                                                        setLocalEditForm({ ...localEditForm, specialDays: newDays });
-                                                    }} />
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">특강시간</label>
-                                                    <input
-                                                        type="time"
-                                                        className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                        value={localEditForm.specialTime || ''}
-                                                        onChange={(e) => setLocalEditForm({ ...localEditForm, specialTime: e.target.value })}
-                                                    />
-                                                </div>
-                                                <div className="grid grid-cols-2 gap-2">
-                                                    <div className="space-y-1">
-                                                        <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">시작일</label>
-                                                        <input
-                                                            type="date"
-                                                            className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                            value={localEditForm.startDate || ''}
-                                                            onChange={(e) => setLocalEditForm({ ...localEditForm, startDate: e.target.value })}
-                                                        />
-                                                    </div>
-                                                    <div className="space-y-1">
-                                                        <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">종료일</label>
-                                                        <input
-                                                            type="date"
-                                                            className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
-                                                            value={localEditForm.endDate || ''}
-                                                            onChange={(e) => setLocalEditForm({ ...localEditForm, endDate: e.target.value })}
-                                                        />
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            <div className="flex justify-end">
-                                                <button
-                                                    onClick={() => {
-                                                        const parts = localEditForm.schoolGrade.split(' ');
-                                                        handleUpdateStagingStudents({
-                                                            department: localEditForm.dept,
-                                                            classes: [localEditForm.class],
-                                                            schoolName: parts[0] || "",
-                                                            grade: parts.slice(1).join(' ') || "",
-                                                            attendanceDays: localEditForm.days,
-                                                            attendanceTime: localEditForm.time,
-                                                            specialDays: localEditForm.specialDays,
-                                                            specialTime: localEditForm.specialTime,
-                                                            startDate: localEditForm.startDate,
-                                                            endDate: localEditForm.endDate
-                                                        });
-                                                    }}
-                                                    className="h-8 px-4 bg-zinc-200 text-zinc-400 rounded-lg text-[11px] font-bold hover:bg-black hover:text-white transition-all"
-                                                >
-                                                    Apply All Changes
-                                                </button>
-                                            </div>
-                                        </div>
-                                    ) : (
-                                        <div className="p-8 text-center">
-                                            <p className="text-[11px] font-bold text-zinc-400 mb-1">학생을 선택해주세요</p>
-                                            <p className="text-[10px] text-zinc-400">우측 리스트에서 체크 먼저 해주세요</p>
-                                        </div>
-                                    )
-                                )}
-                            </div>
-
-                            <div className={`group rounded-xl transition-all duration-200 overflow-hidden ${showSidebarAdd ? 'bg-zinc-50' : 'hover:bg-zinc-50'}`}>
-                                <button
-                                    onClick={() => { setShowSidebarAdd(!showSidebarAdd); if (!showSidebarAdd) { setShowSidebarEdit(false); setShowExcelBridge(false); setShowHistory(false); } }}
-                                    className="w-full h-11 flex items-center justify-between px-4 py-3 text-left bg-white hover:bg-zinc-50/50 transition-colors"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <div className={`w-7 h-7 rounded-md flex items-center justify-center transition-colors ${showSidebarAdd ? 'bg-black text-white' : 'text-zinc-400 group-hover:text-black'}`}>
-                                            <UserPlus size={14} />
-                                        </div>
-                                        <span className={`text-[12px] font-bold transition-colors ${showSidebarAdd ? 'text-black' : 'text-zinc-500 group-hover:text-black'}`}>Individual Add</span>
-                                    </div>
-                                    <ChevronDown size={14} className={`text-zinc-300 transition-transform duration-300 ${showSidebarAdd ? 'rotate-180 text-black' : 'group-hover:text-zinc-500'}`} />
-                                </button>
-
-                                {showSidebarAdd && (
-                                    <div className="p-4 border-t border-zinc-100 bg-zinc-50/30 space-y-3 animate-in slide-in-from-top-1 duration-200">
+                            {/* Information Edit */}
+                            <ImportPanel label="Information Edit" icon={<Layers size={14} />}
+                                open={showSidebarEdit} onToggle={() => togglePanel(showSidebarEdit ? null : 'edit')}>
+                                {importSelectedIds.size > 0 ? (
+                                    <div className="p-4 border-t border-zinc-100 bg-zinc-50/30 space-y-4">
+                                        <span className="text-[10px] font-bold text-black uppercase tracking-wide bg-zinc-200 px-2 py-0.5 rounded-full">{importSelectedIds.size} SELECTED</span>
                                         <div className="space-y-3">
-                                            <SidebarInput placeholder="소속 (예: 2단지)" id="add-dept" />
-                                            <SidebarInput placeholder="이름" id="add-name" />
-                                            <SidebarInput placeholder="반명" id="add-class" />
-                                            <SidebarInput placeholder="학교학년" id="add-schoolGrade" />
-
-                                            <div className="space-y-1">
-                                                <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">요일 선택</label>
-                                                <DayPicker selectedDays={addFormDays} onToggle={(d) => {
-                                                    setAddFormDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]);
-                                                }} />
-                                            </div>
-                                            <div className="space-y-1">
-                                                <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">등원 시간</label>
-                                                <input
-                                                    type="time"
-                                                    className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white text-zinc-400"
-                                                    value={addFormTime}
-                                                    onChange={(e) => setAddFormTime(e.target.value)}
-                                                />
-                                            </div>
-
-                                            <div className="space-y-1">
-                                                <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">첫 등원일</label>
-                                                <input
-                                                    type="date"
-                                                    id="add-firstDate"
-                                                    max={new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]}
-                                                    min={new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]}
-                                                    className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white text-zinc-400"
-                                                />
-                                            </div>
-
-                                            <div className="flex justify-end">
-                                                <button
-                                                    onClick={() => {
-                                                        const dept = document.getElementById('add-dept').value;
-                                                        const name = document.getElementById('add-name').value;
-                                                        const cls = document.getElementById('add-class').value;
-                                                        const sg = document.getElementById('add-schoolGrade').value;
-                                                        if (!name) return;
-                                                        handleIndividualAdd({
-                                                            department: dept,
-                                                            name,
-                                                            classes: [cls],
-                                                            schoolGrade: sg,
-                                                            attendanceDays: addFormDays,
-                                                            attendanceTime: addFormTime
-                                                        });
-                                                        ['add-dept', 'add-name', 'add-class', 'add-schoolGrade'].forEach(id => document.getElementById(id).value = '');
-                                                        setAddFormDays([]);
-                                                        setAddFormTime('');
-                                                        setShowSidebarAdd(false);
-                                                    }}
-                                                    className="h-8 px-4 bg-zinc-200 text-zinc-400 rounded-lg text-[11px] font-bold hover:bg-black hover:text-white transition-all"
-                                                >
-                                                    Add to Staging
-                                                </button>
+                                            <FormRow label="소속">
+                                                <select className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                                    value={localEditForm.dept}
+                                                    onChange={e => { setLocalEditForm(f => ({ ...f, dept: e.target.value })); handleUpdateStagingStudents({ department: e.target.value }); }}>
+                                                    <option value="">소속 선택...</option>
+                                                    <option value="2단지">2단지</option>
+                                                    <option value="10단지">10단지</option>
+                                                    <option value="기타">기타</option>
+                                                </select>
+                                            </FormRow>
+                                            <FormRow label="반명">
+                                                <input className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                                    value={localEditForm.class}
+                                                    onChange={e => setLocalEditForm(f => ({ ...f, class: e.target.value }))}
+                                                    onKeyDown={e => e.key === 'Enter' && handleUpdateStagingStudents({ classes: [localEditForm.class] })} />
+                                            </FormRow>
+                                            <FormRow label="학교학년">
+                                                <input className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                                    value={localEditForm.schoolGrade}
+                                                    onChange={e => setLocalEditForm(f => ({ ...f, schoolGrade: e.target.value }))}
+                                                    onKeyDown={e => {
+                                                        if (e.key !== 'Enter') return;
+                                                        const [sn, ...gp] = localEditForm.schoolGrade.split(' ');
+                                                        handleUpdateStagingStudents({ schoolName: sn || '', grade: gp.join(' ') || '' });
+                                                    }} />
+                                            </FormRow>
+                                            <FormRow label="정규요일">
+                                                <DayPicker selectedDays={localEditForm.days} onToggle={d => setLocalEditForm(f => ({ ...f, days: f.days.includes(d) ? f.days.filter(x => x !== d) : [...f.days, d] }))} />
+                                            </FormRow>
+                                            <FormRow label="정규시간">
+                                                <input type="time" className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                                    value={localEditForm.time || ''}
+                                                    onChange={e => setLocalEditForm(f => ({ ...f, time: e.target.value }))} />
+                                            </FormRow>
+                                            <FormRow label="특강요일">
+                                                <DayPicker selectedDays={localEditForm.specialDays} onToggle={d => setLocalEditForm(f => ({ ...f, specialDays: f.specialDays.includes(d) ? f.specialDays.filter(x => x !== d) : [...f.specialDays, d] }))} />
+                                            </FormRow>
+                                            <FormRow label="특강시간">
+                                                <input type="time" className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                                    value={localEditForm.specialTime || ''}
+                                                    onChange={e => setLocalEditForm(f => ({ ...f, specialTime: e.target.value }))} />
+                                            </FormRow>
+                                            <FormRow label="임의요일">
+                                                <DayPicker selectedDays={localEditForm.extraDays || []} onToggle={d => setLocalEditForm(f => ({ ...f, extraDays: (f.extraDays || []).includes(d) ? (f.extraDays || []).filter(x => x !== d) : [...(f.extraDays || []), d] }))} />
+                                            </FormRow>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <FormRow label="시작일">
+                                                    <input type="date" className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                                        value={localEditForm.startDate || ''}
+                                                        onChange={e => setLocalEditForm(f => ({ ...f, startDate: e.target.value }))} />
+                                                </FormRow>
+                                                <FormRow label="종료일">
+                                                    <input type="date" className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                                        value={localEditForm.endDate || ''}
+                                                        onChange={e => setLocalEditForm(f => ({ ...f, endDate: e.target.value }))} />
+                                                </FormRow>
                                             </div>
                                         </div>
-                                    </div>
-                                )}
-                            </div>
-
-                            <div className={`group rounded-xl transition-all duration-200 overflow-hidden ${showExcelBridge ? 'bg-zinc-50' : 'hover:bg-zinc-50'}`}>
-                                <button
-                                    onClick={() => { setShowExcelBridge(!showExcelBridge); if (!showExcelBridge) { setShowSidebarAdd(false); setShowSidebarEdit(false); setShowHistory(false); } }}
-                                    className="w-full h-11 flex items-center justify-between px-4 py-3 text-left bg-white hover:bg-zinc-50/50 transition-colors"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <div className={`w-7 h-7 rounded-md flex items-center justify-center transition-colors ${showExcelBridge ? 'bg-black text-white' : 'text-zinc-400 group-hover:text-black'}`}>
-                                            <FileText size={14} />
-                                        </div>
-                                        <span className={`text-[12px] font-bold transition-colors ${showExcelBridge ? 'text-black' : 'text-zinc-500 group-hover:text-black'}`}>Excel Bridge</span>
-                                    </div>
-                                    <ChevronDown size={14} className={`text-zinc-300 transition-transform duration-300 ${showExcelBridge ? 'rotate-180 text-black' : 'group-hover:text-zinc-500'}`} />
-                                </button>
-
-                                {showExcelBridge && (
-                                    <div className="p-4 border-t border-zinc-100 bg-zinc-50/30 space-y-3 animate-in slide-in-from-top-1 duration-200">
-                                        <textarea
-                                            value={bulkPastedText}
-                                            onChange={e => setBulkPastedText(e.target.value)}
-                                            placeholder="Paste Excel rows here..."
-                                            className="w-full h-24 bg-white border border-zinc-200 rounded-xl p-3 text-[12px] resize-none focus:outline-none focus:ring-2 focus:ring-zinc-900/10"
-                                        ></textarea>
                                         <div className="flex justify-end">
-                                            <button
-                                                onClick={() => {
-                                                    try {
-                                                        if (!bulkPastedText.trim()) return;
-                                                        const now = new Date();
-                                                        const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                                                        const dateStr = now.toLocaleDateString([], { month: 'short', day: 'numeric' });
-                                                        const sessionName = `${dateStr} ${timeStr}`;
-                                                        const lines = bulkPastedText.trim().split(/\r?\n/);
-                                                        const seen = new Set();
-
-                                                        const parsed = lines.map((line, i) => {
-                                                            if (!line.trim()) return null;
-                                                            const cols = line.split('\t').map(c => (c || "").trim());
-                                                            if (cols.length < 1 || !cols[0]) return null;
-
-                                                            const name = cols[0];
-                                                            const classStr = cols[3] || "Unassigned";
-                                                            const school = cols[5] || "";
-                                                            const grade = cols[6] || "";
-
-                                                            const dupKey = `${name}${classStr}${school}${grade}`.replace(/\s+/g, '');
-                                                            if (seen.has(dupKey)) return null;
-                                                            seen.add(dupKey);
-
-                                                            const thirdFromEnd = classStr.length >= 3 ? classStr.charAt(classStr.length - 3) : "";
-                                                            const department = thirdFromEnd === '1' ? '2단지' : (thirdFromEnd === '2' ? '10단지' : '기타');
-
-                                                            return createBlankSession({
-                                                                id: `${Date.now()}-${i}-${Math.random().toString(36).substr(2, 9)}`,
-                                                                department: department,
-                                                                name: name,
-                                                                classes: [classStr],
-                                                                schoolGrade: `${school} ${grade}`.trim()
-                                                            });
-                                                        }).filter(Boolean);
-
-                                                        if (parsed.length > 0) {
-                                                            const newImport = { id: Date.now().toString(), name: `Import ${new Date().toLocaleString()}`, students: parsed, isCommited: false };
-                                                            setImportHistory(prev => [newImport, ...prev]);
-                                                            setActiveImportId(newImport.id);
-                                                            setBulkPastedText('');
-                                                            setShowExcelBridge(false);
-                                                        }
-                                                    } catch (err) {
-                                                        console.error("Import Error:", err);
-                                                        alert("데이터 처리 중 오류가 발생했습니다. 입력 데이터를 확인해주세요.");
-                                                    }
-                                                }}
-                                                className="h-8 px-4 bg-zinc-200 text-zinc-400 rounded-lg text-[11px] font-bold hover:bg-black hover:text-white transition-all flex items-center gap-2"
-                                            >
-                                                <Plus size={14} /> Stage Text Data
+                                            <button onClick={() => {
+                                                const [sn, ...gp] = localEditForm.schoolGrade.split(' ');
+                                                handleUpdateStagingStudents({
+                                                    department: localEditForm.dept,
+                                                    classes: [localEditForm.class],
+                                                    schoolName: sn || '', grade: gp.join(' ') || '',
+                                                    attendanceDays: localEditForm.days, attendanceTime: localEditForm.time,
+                                                    specialDays: localEditForm.specialDays, specialTime: localEditForm.specialTime,
+                                                    extraDays: localEditForm.extraDays,
+                                                    startDate: localEditForm.startDate, endDate: localEditForm.endDate,
+                                                });
+                                            }} className="h-8 px-4 bg-zinc-200 text-zinc-400 rounded-lg text-[11px] font-bold hover:bg-black hover:text-white transition-all">
+                                                Apply All Changes
                                             </button>
                                         </div>
                                     </div>
-                                )}
-                            </div>
-
-                            <div className={`group rounded-xl transition-all duration-200 overflow-hidden ${showHistory ? 'bg-zinc-50' : 'hover:bg-zinc-50'}`}>
-                                <button
-                                    onClick={() => { setShowHistory(!showHistory); if (!showHistory) { setShowSidebarAdd(false); setShowSidebarEdit(false); setShowExcelBridge(false); } }}
-                                    className="w-full h-11 flex items-center justify-between px-4 py-3 text-left bg-white hover:bg-zinc-50/50 transition-colors"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <div className={`w-7 h-7 rounded-md flex items-center justify-center transition-colors ${showHistory ? 'bg-black text-white' : 'text-zinc-400 group-hover:text-black'}`}>
-                                            <Clock size={14} />
-                                        </div>
-                                        <span className={`text-[12px] font-bold transition-colors ${showHistory ? 'text-black' : 'text-zinc-500 group-hover:text-black'}`}>History</span>
-                                    </div>
-                                    <ChevronDown size={14} className={`text-zinc-300 transition-transform duration-300 ${showHistory ? 'rotate-180 text-black' : 'group-hover:text-zinc-500'}`} />
-                                </button>
-
-                                {showHistory && (
-                                    <div className="p-2 border-t border-zinc-100 bg-zinc-50/30 space-y-1 animate-in slide-in-from-top-1 duration-200">
-                                        <div className="px-1 py-1">
-                                            <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest mb-2 flex items-center gap-2">
-                                                <div className="h-[1px] flex-1 bg-zinc-100" />
-                                                Cloud Backup
-                                                <div className="h-[1px] flex-1 bg-zinc-100" />
-                                            </p>
-                                            <div className="max-h-40 overflow-y-auto space-y-1 mb-4 scrollbar-hide">
-                                                {cloudTabs.length > 0 ? cloudTabs.map(tab => (
-                                                    <div key={tab} className="flex items-center justify-between p-2 rounded-lg bg-zinc-50 border border-zinc-100 hover:border-indigo-200 transition-all group">
-                                                        <span className="text-[11px] font-bold text-zinc-600">{tab}</span>
-                                                        <button
-                                                            onClick={(e) => { e.stopPropagation(); handleCloneCloudTab(tab); }}
-                                                            className="px-2 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[9px] font-black opacity-0 group-hover:opacity-100 transition-opacity"
-                                                        >
-                                                            CLONE
-                                                        </button>
-                                                    </div>
-                                                )) : (
-                                                    <button onClick={fetchCloudTabs} className="w-full py-2 text-[10px] font-bold text-indigo-400 hover:text-indigo-600 transition-colors">
-                                                        Load Cloud History...
-                                                    </button>
-                                                )}
-                                            </div>
-
-                                            <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest mb-2 flex items-center gap-2">
-                                                <div className="h-[1px] flex-1 bg-zinc-100" />
-                                                Local Imports
-                                                <div className="h-[1px] flex-1 bg-zinc-100" />
-                                            </p>
-                                            <div className="space-y-1">
-                                                {importHistory.map(session => (
-                                                    <div
-                                                        key={session.id}
-                                                        onClick={() => { setActiveImportId(session.id); setImportSelectedIds(new Set()); setImportSearchQuery(''); }}
-                                                        className={`flex items-center justify-between p-3 rounded-lg cursor-pointer border transition-all ${activeImportId === session.id ? 'bg-white border-zinc-300 shadow-md ring-1 ring-black/5' : 'bg-transparent border-transparent hover:bg-white hover:border-zinc-200 hover:shadow-sm'}`}
-                                                    >
-                                                        <div className="min-w-0">
-                                                            <p className="text-[12px] font-bold text-zinc-900 truncate tracking-tight">{session.name}</p>
-                                                            <p className="text-[10px] font-medium text-zinc-500">{session.students.length} students</p>
-                                                        </div>
-                                                        <X size={12} onClick={(e) => { e.stopPropagation(); setImportHistory(prev => prev.filter(s => s.id !== session.id)); if (activeImportId === session.id) setActiveImportId(null); }} className="text-zinc-400 hover:text-red-500 transition-colors" />
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        </div>
-                                        {importHistory.length > 0 && (
-                                            <div className="pt-2 px-1">
-                                                <button
-                                                    onClick={() => { if (confirm("모든 히스토리를 삭제하시겠습니까?")) { setImportHistory([]); setActiveImportId(null); } }}
-                                                    className="w-full py-2 text-[10px] font-bold text-zinc-400 hover:text-red-500 hover:bg-red-50/50 rounded-lg transition-all flex items-center justify-center gap-1.5"
-                                                >
-                                                    Clear All History
-                                                </button>
-                                            </div>
-                                        )}
-                                        {importHistory.length === 0 && (
-                                            <div className="p-8 text-center text-[11px] text-zinc-400 font-medium italic">
-                                                No history yet
-                                            </div>
-                                        )}
+                                ) : (
+                                    <div className="p-8 text-center">
+                                        <p className="text-[11px] font-bold text-zinc-400 mb-1">학생을 선택해주세요</p>
+                                        <p className="text-[10px] text-zinc-400">우측 리스트에서 체크 먼저 해주세요</p>
                                     </div>
                                 )}
-                            </div>
+                            </ImportPanel>
+
+                            {/* Individual Add */}
+                            <ImportPanel label="Individual Add" icon={<UserPlus size={14} />}
+                                open={showSidebarAdd} onToggle={() => togglePanel(showSidebarAdd ? null : 'add')}>
+                                <div className="p-4 border-t border-zinc-100 bg-zinc-50/30 space-y-3">
+                                    <SidebarInput placeholder="소속 (예: 2단지)" id="add-dept" />
+                                    <SidebarInput placeholder="이름" id="add-name" />
+                                    <SidebarInput placeholder="반명" id="add-class" />
+                                    <SidebarInput placeholder="학교학년" id="add-schoolGrade" />
+                                    <FormRow label="요일 선택">
+                                        <DayPicker selectedDays={addFormDays} onToggle={d => setAddFormDays(p => p.includes(d) ? p.filter(x => x !== d) : [...p, d])} />
+                                    </FormRow>
+                                    <FormRow label="등원 시간">
+                                        <input type="time" className="w-full h-9 border border-zinc-200 rounded-lg px-2 text-[12px] font-medium focus:outline-none focus:border-zinc-400 bg-white"
+                                            value={addFormTime} onChange={e => setAddFormTime(e.target.value)} />
+                                    </FormRow>
+                                    <div className="flex justify-end">
+                                        <button onClick={() => {
+                                            const name = document.getElementById('add-name').value;
+                                            if (!name) return;
+                                            handleIndividualAdd({
+                                                department: document.getElementById('add-dept').value,
+                                                name,
+                                                classes: [document.getElementById('add-class').value],
+                                                schoolGrade: document.getElementById('add-schoolGrade').value,
+                                                attendanceDays: addFormDays,
+                                                attendanceTime: addFormTime,
+                                            });
+                                            ['add-dept', 'add-name', 'add-class', 'add-schoolGrade'].forEach(id => { document.getElementById(id).value = ''; });
+                                            setAddFormDays([]);
+                                            setAddFormTime('');
+                                            togglePanel(null);
+                                        }} className="h-8 px-4 bg-zinc-200 text-zinc-400 rounded-lg text-[11px] font-bold hover:bg-black hover:text-white transition-all">
+                                            Add to Staging
+                                        </button>
+                                    </div>
+                                </div>
+                            </ImportPanel>
+
+                            {/* Excel Bridge */}
+                            <ImportPanel label="Excel Bridge" icon={<FileText size={14} />}
+                                open={showExcelBridge} onToggle={() => togglePanel(showExcelBridge ? null : 'excel')}>
+                                <div className="p-4 border-t border-zinc-100 bg-zinc-50/30 space-y-3">
+                                    <textarea value={bulkPastedText} onChange={e => setBulkPastedText(e.target.value)}
+                                        placeholder="Paste Excel rows here..."
+                                        className="w-full h-24 bg-white border border-zinc-200 rounded-xl p-3 text-[12px] resize-none focus:outline-none focus:ring-2 focus:ring-zinc-900/10" />
+                                    <div className="flex justify-end">
+                                        <button onClick={() => {
+                                            if (!bulkPastedText.trim()) return;
+                                            const seen = new Set();
+                                            const parsed = bulkPastedText.trim().split(/\r?\n/).map((line, i) => {
+                                                if (!line.trim()) return null;
+                                                const cols = line.split('\t').map(c => (c || '').trim());
+                                                if (!cols[0]) return null;
+                                                const [name, , , classStr = 'Unassigned', , school = '', grade = ''] = cols;
+                                                const dupKey = `${name}${classStr}${school}${grade}`.replace(/\s+/g, '');
+                                                if (seen.has(dupKey)) return null;
+                                                seen.add(dupKey);
+                                                const c3 = classStr.length >= 3 ? classStr.charAt(classStr.length - 3) : '';
+                                                const dept = c3 === '1' ? '2단지' : c3 === '2' ? '10단지' : '기타';
+                                                return normalizeSession(createBlankSession({ id: `${Date.now()}-${i}-${Math.random().toString(36).substr(2, 9)}`, department: dept, name, classes: [classStr], schoolGrade: `${school} ${grade}`.trim() }));
+                                            }).filter(Boolean);
+                                            if (parsed.length > 0) {
+                                                const newImport = { id: Date.now().toString(), name: `Import ${new Date().toLocaleString()}`, students: parsed, isCommited: false };
+                                                setImportHistory(prev => [newImport, ...prev]);
+                                                setActiveImportId(newImport.id);
+                                                setBulkPastedText('');
+                                                togglePanel(null);
+                                            }
+                                        }} className="h-8 px-4 bg-zinc-200 text-zinc-400 rounded-lg text-[11px] font-bold hover:bg-black hover:text-white transition-all flex items-center gap-2">
+                                            <Plus size={14} /> Stage Text Data
+                                        </button>
+                                    </div>
+                                </div>
+                            </ImportPanel>
+
+                            {/* History */}
+                            <ImportPanel label="History" icon={<Clock size={14} />}
+                                open={showHistory} onToggle={() => togglePanel(showHistory ? null : 'history')}>
+                                <div className="p-2 border-t border-zinc-100 bg-zinc-50/30 space-y-1">
+                                    <SectionDivider label="Cloud Backup" />
+                                    <div className="max-h-40 overflow-y-auto space-y-1 mb-4 scrollbar-hide">
+                                        {cloudTabs.length > 0 ? cloudTabs.map(tab => (
+                                            <div key={tab} className="flex items-center justify-between p-2 rounded-lg bg-zinc-50 border border-zinc-100 hover:border-indigo-200 transition-all group">
+                                                <span className="text-[11px] font-bold text-zinc-600">{tab}</span>
+                                                <button onClick={() => handleCloneCloudTab(tab)}
+                                                    className="px-2 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[9px] font-black opacity-0 group-hover:opacity-100 transition-opacity">CLONE</button>
+                                            </div>
+                                        )) : (
+                                            <button onClick={fetchCloudTabs} className="w-full py-2 text-[10px] font-bold text-indigo-400 hover:text-indigo-600 transition-colors">
+                                                Load Cloud History...
+                                            </button>
+                                        )}
+                                    </div>
+
+                                    <SectionDivider label="Local Imports" />
+                                    <div className="space-y-1">
+                                        {importHistory.map(session => (
+                                            <div key={session.id}
+                                                onClick={() => { setActiveImportId(session.id); setImportSelectedIds(new Set()); setImportSearchQuery(''); }}
+                                                className={`flex items-center justify-between p-3 rounded-lg cursor-pointer border transition-all ${activeImportId === session.id ? 'bg-white border-zinc-300 shadow-md ring-1 ring-black/5' : 'bg-transparent border-transparent hover:bg-white hover:border-zinc-200'}`}>
+                                                <div className="min-w-0">
+                                                    <p className="text-[12px] font-bold text-zinc-900 truncate tracking-tight">{session.name}</p>
+                                                    <p className="text-[10px] font-medium text-zinc-500">{session.students.length} students</p>
+                                                </div>
+                                                <X size={12} className="text-zinc-400 hover:text-red-500 transition-colors"
+                                                    onClick={e => { e.stopPropagation(); setImportHistory(prev => prev.filter(s => s.id !== session.id)); if (activeImportId === session.id) setActiveImportId(null); }} />
+                                            </div>
+                                        ))}
+                                    </div>
+                                    {importHistory.length > 0 && (
+                                        <button onClick={() => { if (confirm('모든 히스토리를 삭제하시겠습니까?')) { setImportHistory([]); setActiveImportId(null); } }}
+                                            className="w-full py-2 text-[10px] font-bold text-zinc-400 hover:text-red-500 hover:bg-red-50/50 rounded-lg transition-all flex items-center justify-center gap-1.5 mt-2">
+                                            Clear All History
+                                        </button>
+                                    )}
+                                    {importHistory.length === 0 && (
+                                        <div className="p-8 text-center text-[11px] text-zinc-400 font-medium italic">No history yet</div>
+                                    )}
+                                </div>
+                            </ImportPanel>
                         </div>
                     </div>
 
                     <div className="p-4 border-t border-border mt-auto">
-                        <button onClick={() => setViewMode('today')} className="w-full h-10 border border-border rounded-xl text-[11px] font-black text-zinc-400 hover:text-black hover:bg-zinc-50 hover:border-zinc-400 transition-all">Back to Dashboard</button>
+                        <button onClick={() => setViewMode('today')}
+                            className="w-full h-10 border border-border rounded-xl text-[11px] font-black text-zinc-400 hover:text-black hover:bg-zinc-50 hover:border-zinc-400 transition-all">
+                            Back to Dashboard
+                        </button>
                     </div>
                 </aside>
             )}
 
+            {/* ── 메인 ── */}
             <main className="flex-1 flex flex-col min-w-0 bg-background/50">
+                {/* 헤더 */}
                 <header className="h-14 border-b border-border flex items-center px-6 justify-between bg-white sticky top-0 z-20">
                     <div className="flex items-center gap-4">
                         <div className="flex flex-col">
-                            <h1 className="font-bold text-[15px] tracking-tight text-black flex items-center gap-2">
-                                {viewMode === 'today' ? "Timeline Viewer" : viewMode === 'master' ? "All Master List" : "Import Hub"}
+                            <h1 className="font-bold text-[15px] tracking-tight text-black">
+                                {viewMode === 'today' ? 'Timeline Viewer' : viewMode === 'import' ? 'Import Hub' : 'Master List'}
                             </h1>
                             {viewMode === 'today' && (
                                 <div className="flex items-center gap-2 mt-0.5">
-                                    <button onClick={() => setSelectedDate(new Date(selectedDate.setDate(selectedDate.getDate() - 1)))} className="p-1 hover:bg-zinc-100 rounded-md transition-colors shrink-0"><ChevronLeft size={14} /></button>
-
-                                    <div
-                                        className="relative cursor-pointer group h-6 flex items-center"
-                                        onClick={() => dateInputRef.current?.showPicker?.()}
-                                    >
+                                    <button onClick={() => moveDate(-1)} className="p-1 hover:bg-zinc-100 rounded-md transition-colors">
+                                        <ChevronLeft size={14} />
+                                    </button>
+                                    <div className="relative cursor-pointer group h-6 flex items-center"
+                                        onClick={() => dateInputRef.current?.showPicker?.()}>
                                         <span className="text-[11px] font-black text-indigo-600 bg-indigo-50 px-3 py-1 rounded-full ring-1 ring-indigo-200 group-hover:bg-indigo-100 transition-all flex items-center gap-1.5 shadow-sm whitespace-nowrap">
                                             <Calendar size={12} />
                                             {selectedDate.toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' })} ({todayName})
                                         </span>
-                                        <input
-                                            ref={dateInputRef}
-                                            type="date"
+                                        <input ref={dateInputRef} type="date"
                                             className="absolute inset-0 opacity-0 pointer-events-none"
                                             value={selectedDate.toLocaleDateString('sv-SE')}
-                                            onChange={(e) => {
-                                                if (e.target.value) {
-                                                    const newDate = new Date(e.target.value);
-                                                    setSelectedDate(newDate);
-                                                }
-                                            }}
-                                        />
+                                            onChange={e => { if (e.target.value) setSelectedDate(new Date(e.target.value)); }} />
                                     </div>
+                                    <button onClick={() => moveDate(1)} className="p-1 hover:bg-zinc-100 rounded-md transition-colors">
+                                        <ChevronRight size={14} />
+                                    </button>
 
-                                    <button onClick={() => setSelectedDate(new Date(selectedDate.setDate(selectedDate.getDate() + 1)))} className="p-1 hover:bg-zinc-100 rounded-md transition-colors shrink-0"><ChevronRight size={14} /></button>
-
-                                    <button onClick={() => {
-                                        const now = new Date();
-                                        setSelectedDate(new Date(now.getFullYear(), now.getMonth(), now.getDate()));
-                                    }} className="h-6 px-2 text-[10px] font-black text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-md transition-all ml-1">Today</button>
+                                    {/* 필터 활성화 표시기 */}
+                                    {(searchQuery !== '' || filters.departments.length > 0 || filters.grades.length > 0 || filters.class !== 'All' || filters.school !== 'All') && (
+                                        <div className="flex items-center gap-1.5 ml-3 px-3 py-1 bg-amber-50 text-amber-700 rounded-full border border-amber-200 shadow-sm animate-in fade-in slide-in-from-left-2 transition-all">
+                                            <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                                            <span className="text-[10px] font-black tracking-tight">
+                                                {searchQuery.trim() ? `"${searchQuery.trim()}" 검색 중` : (searchQuery !== '' ? '공백 검색 중' : '필터 활성화')}
+                                            </span>
+                                            <button
+                                                onClick={() => { setSearchQuery(''); clearFiltersFromStore(); }}
+                                                className="ml-1 hover:bg-amber-100 p-0.5 rounded-full transition-colors"
+                                                title="검색 및 필터 초기화"
+                                            >
+                                                <X size={12} strokeWidth={3} />
+                                            </button>
+                                        </div>
+                                    )}
+                                    <button onClick={() => setSelectedDate(new Date())}
+                                        className="h-6 px-2 text-[10px] font-black text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-md transition-all ml-1">Today</button>
                                 </div>
                             )}
                         </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                        <button
-                            onClick={() => { if (viewMode === 'import') setViewMode('today'); else setViewMode('import'); }}
-                            className={`h-8 px-3 rounded-md text-[11px] font-bold transition-all flex items-center gap-2 ${viewMode === 'import' ? 'bg-zinc-100 text-black border border-border' : 'bg-black text-white'}`}
-                        >
-                            <DownloadCloud size={14} /> {viewMode === 'import' ? 'Exit Import' : 'Import Data'}
-                        </button>
-                    </div>
+                    <button onClick={() => setViewMode(viewMode === 'import' ? 'today' : 'import')}
+                        className={`h-8 px-3 rounded-md text-[11px] font-bold transition-all flex items-center gap-2 ${viewMode === 'import' ? 'bg-zinc-100 text-black border border-border' : 'bg-black text-white'}`}>
+                        <DownloadCloud size={14} />
+                        {viewMode === 'import' ? 'Exit Import' : 'Import Data'}
+                    </button>
                 </header>
 
                 <div className="flex-1 flex flex-col min-h-0 relative">
                     {viewMode !== 'import' ? (
                         <div className="flex-1 overflow-y-auto px-6 py-4">
+                            {/* 검색 / 필터 바 */}
                             <div className="flex items-center gap-2 mb-6 flex-wrap overflow-x-auto pb-2 scrollbar-hide">
-                                <div className="relative group min-w-[200px]">
+                                <div className="relative min-w-[200px]">
                                     <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground/40" />
-                                    <input placeholder="Search..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="h-9 w-48 bg-muted/40 border border-border rounded-xl pl-9 pr-4 text-[12px] focus:outline-none focus:ring-1 focus:ring-black/10 transition-all font-medium" />
+                                    <input placeholder="Search..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+                                        className="h-9 w-48 bg-muted/40 border border-border rounded-xl pl-9 pr-4 text-[12px] focus:outline-none focus:ring-1 focus:ring-black/10 transition-all font-medium" />
                                 </div>
 
                                 <div className="h-4 w-[1px] bg-zinc-200 mx-1 shrink-0" />
@@ -1628,244 +1305,68 @@ export default function Dashboard() {
                                     ))}
                                     <button onClick={clearFilters} className="h-7 px-2 rounded-lg text-[10px] font-black text-zinc-400 hover:text-red-500 transition-all border-l border-zinc-200 ml-1 pl-2">Clear</button>
                                 </div>
-                                <button
-                                    onClick={() => {
-                                        const newPinned = !isFilterPinned;
-                                        setIsFilterPinned(newPinned);
-                                        localStorage.setItem('impact7_pinned', newPinned);
-                                        if (newPinned) localStorage.setItem('impact7_filters', JSON.stringify(filters));
-                                    }}
-                                    className={`h-9 w-9 flex items-center justify-center rounded-xl border transition-all shrink-0 ${isFilterPinned ? 'text-indigo-600 bg-indigo-50 border-indigo-200 shadow-sm' : 'text-zinc-300 hover:text-zinc-500 border-zinc-200'}`}
-                                >
-                                    <Pin size={14} fill={isFilterPinned ? "currentColor" : "none"} />
+                                <button onClick={() => {
+                                    const next = !isFilterPinned;
+                                    setIsFilterPinned(next);
+                                    localStorage.setItem('impact7_pinned', String(next));
+                                    if (next) localStorage.setItem('impact7_filters', JSON.stringify(filters));
+                                }} className={`h-9 w-9 flex items-center justify-center rounded-xl border transition-all shrink-0 ${isFilterPinned ? 'text-indigo-600 bg-indigo-50 border-indigo-200 shadow-sm' : 'text-zinc-300 hover:text-zinc-500 border-zinc-200'}`}>
+                                    <Pin size={14} fill={isFilterPinned ? 'currentColor' : 'none'} />
                                 </button>
                             </div>
 
-                            {/* Memo Management Modal */}
+                            {/* 메모 모달 */}
                             {showMemoModal && activeMemoStudent && (
-                                <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm animate-in fade-in duration-200">
-                                    <div className="bg-white rounded-[32px] shadow-[0_32px_80px_rgba(0,0,0,0.3)] w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
-                                        <div className="px-8 py-6 border-b border-black/[0.05] flex items-center justify-between bg-zinc-50/50">
-                                            <div>
-                                                <h3 className="text-xl font-black text-black tracking-tighter">{activeMemoStudent.name}</h3>
-                                                <p className="text-[10px] font-bold text-black/40 uppercase tracking-widest leading-none mt-1">Student Memos</p>
-                                            </div>
-                                            <button
-                                                onClick={() => {
-                                                    setShowMemoModal(false);
-                                                    setActiveMemoStudent(null);
-                                                }}
-                                                className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-black/5 text-black/20 hover:text-black transition-all"
-                                            >
-                                                <X size={20} />
-                                            </button>
-                                        </div>
-
-                                        <div className="p-8 max-h-[60vh] overflow-y-auto custom-scrollbar">
-                                            {(() => {
-                                                const raw = activeMemoStudent.checks?.memos?.toDesk;
-                                                let memos = [];
-                                                try {
-                                                    if (raw) {
-                                                        const parsed = JSON.parse(raw);
-                                                        memos = Array.isArray(parsed) ? parsed : [{ id: 'legacy', text: raw, date: '' }];
-                                                    }
-                                                } catch (e) {
-                                                    if (raw) memos = [{ id: 'legacy', text: raw, date: '' }];
-                                                }
-
-                                                if (memos.length === 0) {
-                                                    return (
-                                                        <div className="text-center py-12">
-                                                            <div className="w-16 h-16 bg-zinc-50 rounded-full flex items-center justify-center mx-auto mb-4 text-zinc-300">
-                                                                <MessageSquare size={24} />
-                                                            </div>
-                                                            <p className="text-sm font-bold text-zinc-400">저장된 메모가 없습니다.</p>
-                                                        </div>
-                                                    );
-                                                }
-
-                                                return (
-                                                    <div className="space-y-4">
-                                                        {memos.map((memo, idx) => (
-                                                            <div key={memo.id || idx} className="group relative bg-zinc-50 hover:bg-zinc-100/80 p-5 rounded-2xl border border-black/5 transition-all">
-                                                                <div className="flex justify-between items-start gap-4">
-                                                                    <div className="flex-1">
-                                                                        <p className="text-[13px] font-medium text-black/80 leading-relaxed whitespace-pre-wrap">
-                                                                            {memo.text}
-                                                                        </p>
-                                                                        {memo.date && (
-                                                                            <div className="mt-3 flex items-center gap-1.5 text-black/20">
-                                                                                <Clock size={10} />
-                                                                                <span className="text-[9px] font-bold uppercase tracking-wider">
-                                                                                    {new Date(memo.date).toLocaleString('ko-KR', {
-                                                                                        month: 'long',
-                                                                                        day: 'numeric',
-                                                                                        hour: '2-digit',
-                                                                                        minute: '2-digit',
-                                                                                        hour12: false
-                                                                                    })}
-                                                                                </span>
-                                                                            </div>
-                                                                        )}
-                                                                    </div>
-                                                                    <button
-                                                                        onClick={() => {
-                                                                            if (confirm('이 메모를 삭제하시겠습니까?')) {
-                                                                                handleDeleteMemo(activeMemoStudent.id, memo.id);
-                                                                            }
-                                                                        }}
-                                                                        className="w-8 h-8 rounded-xl bg-white shadow-sm border border-black/5 flex items-center justify-center text-red-400 hover:bg-red-500 hover:text-white transition-all opacity-0 group-hover:opacity-100"
-                                                                    >
-                                                                        <X size={14} />
-                                                                    </button>
-                                                                </div>
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                );
-                                            })()}
-                                        </div>
-
-                                        <div className="p-8 pt-0">
-                                            <button
-                                                onClick={() => setShowMemoModal(false)}
-                                                className="w-full h-14 bg-black text-white rounded-2xl text-sm font-black hover:bg-zinc-800 transition-all shadow-xl shadow-black/10 active:scale-[0.98]"
-                                            >
-                                                닫기
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
+                                <MemoModal
+                                    student={activeMemoStudent}
+                                    onClose={() => { setShowMemoModal(false); setActiveMemoStudent(null); }}
+                                    onDelete={(memoId) => handleDeleteMemo(activeMemoStudent.id, memoId)}
+                                />
                             )}
 
+                            {/* 학생 프로필 모달 */}
+                            {showProfileModal && activeProfileStudent && (
+                                <ProfileModal
+                                    student={activeProfileStudent}
+                                    show={showProfileModal}
+                                    onClose={() => { setShowProfileModal(false); setActiveProfileStudent(null); }}
+                                    onUpdate={handleUpdateStudent}
+                                    todayName={todayName}
+                                    showHighlight={viewMode !== 'import'}
+                                />
+                            )}
+
+                            {/* 일괄 액션 플로팅 바 */}
                             {selectedSessionIds.size > 0 && (
-                                <div className="fixed bottom-10 left-1/2 -translate-x-1/2 bg-white/90 backdrop-blur-2xl border border-white/40 shadow-[0_25px_60px_rgba(0,0,0,0.2)] rounded-3xl px-8 py-4 flex items-center gap-8 z-50 animate-in slide-in-from-bottom-5 ring-1 ring-black/[0.03] min-w-fit">
-                                    <div className="flex items-center gap-3 pr-6 border-r border-black/[0.08]">
-                                        <span className="text-2xl font-black text-black/90 tracking-tighter">{selectedSessionIds.size}</span>
-                                        <div className="flex flex-col -space-y-1">
-                                            <span className="text-[9px] font-black text-black/30 uppercase tracking-widest leading-none">Selected</span>
-                                            <span className="text-[10px] font-bold text-black/60 capitalize leading-none">Students</span>
-                                        </div>
-                                    </div>
-
-                                    <div className="flex items-center gap-3">
-                                        {(viewMode === 'coursework' || viewMode === 'retention') ? (
-                                            <React.Fragment>
-                                                {homeworkSubView !== 'next' && (
-                                                    <div className="relative">
-                                                        <select
-                                                            className="h-9 px-3 rounded-xl bg-white border border-black/10 text-[11px] font-bold text-black focus:outline-none focus:ring-2 focus:ring-black/5"
-                                                            onChange={(e) => {
-                                                                const val = e.target.value;
-                                                                if (val) setSelectedHomeworkAreas(new Set([val]));
-                                                                else setSelectedHomeworkAreas(new Set());
-                                                            }}
-                                                            value={selectedHomeworkAreas.size === 1 ? Array.from(selectedHomeworkAreas)[0] : ''}
-                                                        >
-                                                            <option value="" disabled>영역 선택</option>
-                                                            {(viewMode === 'retention' ? RETENTION_AREAS : COURSEWORK_AREAS).map(area => (
-                                                                <option key={area.key} value={area.key}>{area.label} ({area.key})</option>
-                                                            ))}
-                                                        </select>
-                                                    </div>
-                                                )}
-
-                                                {homeworkSubView !== 'next' ? (
-                                                    <div className="flex gap-1.5 p-1 bg-black/[0.03] rounded-2xl">
-                                                        <button
-                                                            onClick={async () => {
-                                                                if (homeworkSubView === '2nd') {
-                                                                    // Validation logic for 2nd check
-                                                                    // In a real scenario, we might need to check individually per student
-                                                                    // For bulk, let's assume if any selected student has no 1st check, we warn.
-                                                                    // But simpler: just pass. The prompt implies specific "alert prompting user".
-                                                                    // Let's check the first selected student for now as a representative, or better, check all:
-                                                                    const hasFirstCheck = selectedIds.every(id => {
-                                                                        const s = sessions.find(student => student.id === id);
-                                                                        if (!s) return false;
-                                                                        const targetStep1 = viewMode === 'retention' ? 'retention1' : 'homework1';
-                                                                        const hw = s.checks?.[targetStep1] || {};
-                                                                        return Object.values(hw).some(v => v);
-                                                                    });
-
-                                                                    if (!hasFirstCheck) {
-                                                                        if (!confirm('경고: 일부 학생의 1st Check 데이터가 없습니다. 계속 진행하시겠습니까?')) return;
-                                                                    }
-                                                                }
-                                                                handleBulkHomeworkUpdate('o');
-                                                            }}
-                                                            className="h-9 px-4 rounded-xl text-[11px] font-bold text-white transition-all shadow-sm hover:scale-105 active:scale-95"
-                                                            style={{ backgroundColor: '#84994F' }}
-                                                        >
-                                                            완료
-                                                        </button>
-                                                        <button onClick={() => handleBulkHomeworkUpdate('triangle')} className="h-9 px-4 rounded-xl text-[11px] font-bold text-white transition-all shadow-sm hover:scale-105 active:scale-95" style={{ backgroundColor: '#FCB53B' }}>부실</button>
-                                                        <button onClick={() => handleBulkHomeworkUpdate('x')} className="h-9 px-4 rounded-xl text-[11px] font-bold text-white transition-all shadow-sm hover:scale-105 active:scale-95" style={{ backgroundColor: '#B45253' }}>안함</button>
-                                                        <button onClick={() => handleBulkHomeworkUpdate('none')} className="h-9 px-4 rounded-xl text-[11px] font-bold text-black/60 transition-all border border-black/5 hover:bg-white hover:scale-105 active:scale-95" style={{ backgroundColor: '#FFE797' }}>취소</button>
-                                                    </div>
-                                                ) : (
-                                                    <div className="flex items-center px-2 text-[10px] font-bold text-black/40">
-                                                        일괄 메모만 가능합니다
-                                                    </div>
-                                                )}
-                                            </React.Fragment>
-                                        ) : (
-                                            <React.Fragment>
-                                                <span className="text-[11px] font-black text-black/40 uppercase tracking-tighter shrink-0">일괄처리</span>
-                                                <div className="flex gap-1.5 p-1 bg-black/[0.03] rounded-2xl">
-                                                    <button onClick={() => handleBulkStatusUpdate('attendance')} className="h-9 px-4 rounded-xl text-[11px] font-bold text-white transition-all shadow-sm hover:scale-105 active:scale-95" style={{ backgroundColor: '#84994F' }}>출석</button>
-                                                    <button onClick={() => handleBulkStatusUpdate('late')} className="h-9 px-4 rounded-xl text-[11px] font-bold text-white transition-all shadow-sm hover:scale-105 active:scale-95" style={{ backgroundColor: '#FCB53B' }}>지각</button>
-                                                    <button onClick={() => handleBulkStatusUpdate('absent')} className="h-9 px-4 rounded-xl text-[11px] font-bold text-white transition-all shadow-sm hover:scale-105 active:scale-95" style={{ backgroundColor: '#B45253' }}>결석</button>
-                                                    <button onClick={() => handleBulkStatusUpdate('waiting')} className="h-9 px-4 rounded-xl text-[11px] font-bold text-black/60 transition-all border border-black/5 hover:bg-white hover:scale-105 active:scale-95" style={{ backgroundColor: '#FFE797' }}>취소</button>
-                                                </div>
-                                            </React.Fragment>
-                                        )}
-                                    </div>
-
-                                    <div className="h-8 w-[1px] bg-black/[0.08]" />
-
-                                    <div className="flex items-center gap-3">
-                                        <div className="flex items-center gap-2 group">
-                                            <button
-                                                onClick={() => bulkMemo.trim() && alert(`[입력 중인 일괄 메모]\n\n${bulkMemo}`)}
-                                                className="w-8 h-8 rounded-full bg-black/5 flex items-center justify-center text-black/40 hover:bg-black hover:text-white transition-all transition-all"
-                                            >
-                                                <MessageSquare size={14} />
-                                            </button>
-                                            <div className="relative">
-                                                <input
-                                                    type="text"
-                                                    value={bulkMemo}
-                                                    onChange={(e) => setBulkMemo(e.target.value)}
-                                                    onKeyDown={(e) => { if (e.key === 'Enter') handleBulkMemoUpdate(); }}
-                                                    placeholder="일괄 메모 입력..."
-                                                    className="h-10 w-56 bg-white border border-black/10 rounded-xl px-4 text-[12px] font-medium focus:outline-none focus:ring-2 focus:ring-black/5 focus:border-black/20 transition-all placeholder:text-black/20"
-                                                />
-                                                <button
-                                                    onClick={handleBulkMemoUpdate}
-                                                    disabled={!bulkMemo.trim()}
-                                                    className="absolute right-1.5 top-1/2 -translate-y-1/2 h-7 px-3 bg-black text-white rounded-lg text-[10px] font-black hover:bg-zinc-800 disabled:opacity-0 transition-all"
-                                                >
-                                                    적용
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div className="pl-4 border-l border-black/[0.08]">
-                                        <button onClick={() => setSelectedSessionIds(new Set())} className="w-9 h-9 flex items-center justify-center rounded-full text-black/20 hover:text-black hover:bg-black/5 transition-all"><X size={20} /></button>
-                                    </div>
-                                </div>
+                                <BulkActionBar
+                                    count={selectedSessionIds.size}
+                                    viewMode={viewMode}
+                                    homeworkSubView={homeworkSubView}
+                                    selectedHomeworkAreas={selectedHomeworkAreas}
+                                    setSelectedHomeworkAreas={setSelectedHomeworkAreas}
+                                    bulkMemo={bulkMemo}
+                                    setBulkMemo={setBulkMemo}
+                                    onStatusUpdate={handleBulkStatusUpdate}
+                                    onHomeworkUpdate={handleBulkHomeworkUpdate}
+                                    onMemoUpdate={handleBulkMemoUpdate}
+                                    onClear={() => setSelectedSessionIds(new Set())}
+                                />
                             )}
 
+                            {/* 테이블 */}
                             <div className="bg-white border border-border rounded-2xl shadow-sm overflow-hidden mb-20 overflow-x-auto">
                                 {filteredSessions.length > 0 ? (
                                     <table className="w-full text-left border-collapse min-w-[800px]">
                                         <thead className="bg-zinc-50 border-b border-border text-[10px] font-black text-muted-foreground uppercase tracking-widest sticky top-0 z-10">
-                                            {(viewMode === 'coursework' || viewMode === 'retention') ? (
+                                            {['coursework', 'retention'].includes(viewMode) ? (
                                                 <tr>
-                                                    <th className="px-6 py-4 w-12 text-center"><input type="checkbox" className="w-3.5 h-3.5 rounded accent-black" checked={selectedSessionIds.size === filteredSessions.length && filteredSessions.length > 0} onChange={() => { if (selectedSessionIds.size === filteredSessions.length) setSelectedSessionIds(new Set()); else setSelectedSessionIds(new Set(filteredSessions.map(s => s.id))); }} /></th>
+                                                    <th className="px-6 py-4 w-12 text-center">
+                                                        <input type="checkbox" className="w-3.5 h-3.5 rounded accent-black"
+                                                            checked={selectedSessionIds.size === filteredSessions.length && filteredSessions.length > 0}
+                                                            onChange={() => setSelectedSessionIds(
+                                                                selectedSessionIds.size === filteredSessions.length ? new Set() : new Set(filteredSessions.map(s => s.id))
+                                                            )} />
+                                                    </th>
                                                     <th className="px-6 py-4">Name</th>
                                                     <th className="px-6 py-4 w-[180px]">Status</th>
                                                     <th className="px-6 py-4 text-center">{viewMode === 'retention' ? '1st Trial' : '1st Check'}</th>
@@ -1873,9 +1374,14 @@ export default function Dashboard() {
                                                     <th className="px-6 py-4 text-center">{viewMode === 'retention' ? 'Next Trial' : 'Next Coursework'}</th>
                                                 </tr>
                                             ) : (
-                                                // Attendance View Header (Original)
                                                 <tr>
-                                                    <th className="px-6 py-4 w-12 text-center"><input type="checkbox" className="w-3.5 h-3.5 rounded accent-black" checked={selectedSessionIds.size === filteredSessions.length && filteredSessions.length > 0} onChange={() => { if (selectedSessionIds.size === filteredSessions.length) setSelectedSessionIds(new Set()); else setSelectedSessionIds(new Set(filteredSessions.map(s => s.id))); }} /></th>
+                                                    <th className="px-6 py-4 w-12 text-center">
+                                                        <input type="checkbox" className="w-3.5 h-3.5 rounded accent-black"
+                                                            checked={selectedSessionIds.size === filteredSessions.length && filteredSessions.length > 0}
+                                                            onChange={() => setSelectedSessionIds(
+                                                                selectedSessionIds.size === filteredSessions.length ? new Set() : new Set(filteredSessions.map(s => s.id))
+                                                            )} />
+                                                    </th>
                                                     <th className="px-6 py-4">Dept</th>
                                                     <th className="px-6 py-4">Name</th>
                                                     <th className="px-6 py-4">School/Class</th>
@@ -1887,365 +1393,163 @@ export default function Dashboard() {
                                         </thead>
                                         <tbody className="divide-y divide-border/50 text-sm">
                                             {filteredSessions.map(s => (
-                                                <tr key={s.id} onClick={() => openDetail(s.id)} className={`hover:bg-zinc-50 transition-colors cursor-pointer ${selectedSessionIds.has(s.id) ? 'bg-zinc-50' : ''}`}>
-                                                    <td className="px-6 py-3 text-center" onClick={e => e.stopPropagation()}><input type="checkbox" checked={selectedSessionIds.has(s.id)} onChange={() => toggleSelection(s.id)} className="w-3.5 h-3.5 rounded accent-black" /></td>
+                                                <tr key={s.id}
+                                                    onClick={() => { setActiveProfileStudent(s); setShowProfileModal(true); }}
+                                                    className={`hover:bg-zinc-50 transition-colors cursor-pointer ${selectedSessionIds.has(s.id) ? 'bg-zinc-50' : ''}`}>
+                                                    <td className="px-6 py-3 text-center" onClick={e => e.stopPropagation()}>
+                                                        <input type="checkbox" checked={selectedSessionIds.has(s.id)} onChange={() => toggleSelection(s.id)} className="w-3.5 h-3.5 rounded accent-black" />
+                                                    </td>
 
-                                                    {(viewMode === 'coursework' || viewMode === 'retention') ? (
-                                                        <React.Fragment>
-                                                            {/* Name Column */}
+                                                    {['coursework', 'retention'].includes(viewMode) ? (
+                                                        <>
                                                             <td className="px-6 py-3 font-black text-[13px]">
-                                                                <div className="flex flex-col">
-                                                                    <div className="flex items-center gap-2">
-                                                                        {s.name}
-                                                                        {s.checks?.memos?.toDesk && (
-                                                                            <button
-                                                                                onClick={(e) => {
-                                                                                    e.stopPropagation();
-                                                                                    setActiveMemoStudent(s);
-                                                                                    setShowMemoModal(true);
-                                                                                }}
-                                                                                className="w-5 h-5 rounded-full flex items-center justify-center text-indigo-500 hover:bg-indigo-50 transition-all relative shrink-0"
-                                                                            >
-                                                                                <MessageSquare size={12} fill="currentColor" fillOpacity={0.2} />
-                                                                                <div className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-indigo-600 rounded-full border border-white" />
-                                                                            </button>
-                                                                        )}
+                                                                <div className="flex items-center gap-2">
+                                                                    <div className="flex items-baseline gap-1.5">
+                                                                        <span>{s.name}</span>
+                                                                        <span className="text-[10px] font-medium text-zinc-400">
+                                                                            {s.schoolName}{s.grade}
+                                                                        </span>
                                                                     </div>
+                                                                    <MemoIndicator student={s} onClick={() => { setActiveMemoStudent(s); setShowMemoModal(true); }} />
                                                                 </div>
                                                             </td>
-
-                                                            {/* Status Column */}
                                                             <td className="px-6 py-3">
-                                                                <div className="flex items-center gap-1.5" onClick={e => e.stopPropagation()}>
-                                                                    <button
-                                                                        onClick={() => {
-                                                                            // If homeworkSubView is active (1st, 2nd, next), this is read-only
-                                                                            if (homeworkSubView) {
-                                                                                // BUT user says: "In the 1st Check view... Attendance status... read-only"
-                                                                                // And "In the Homework view... input is not allowed for 1st check... but Status displays... toggle in sync"
-                                                                                // Wait.
-                                                                                // "In the Homework view... Status displays P, L, A buttons that toggle in sync" -> Allowed.
-                                                                                // "In the 1st Check view... Attendance status... read-only" -> Disallowed.
-                                                                                // So if homeworkSubView is null (Homework view), Allow. If '1st', '2nd', 'next', Disallow.
-                                                                                alert("이 뷰에서는 출석 상태를 변경할 수 없습니다.");
-                                                                                return;
-                                                                            }
-                                                                            handleInstantStatus(s, 'attendance');
-                                                                        }}
-                                                                        className={`h-7 px-2.5 rounded-lg text-[10px] font-black transition-all border ${s.status === 'attendance' ? 'text-white border-transparent' : 'bg-zinc-100/50 text-zinc-400 border-zinc-200/50 hover:bg-white hover:border-zinc-300'} ${homeworkSubView ? 'cursor-not-allowed opacity-80' : ''}`}
-                                                                        style={s.status === 'attendance' ? { backgroundColor: '#84994F' } : {}}
-                                                                    >P</button>
-                                                                    <button
-                                                                        onClick={() => {
-                                                                            if (homeworkSubView) {
-                                                                                alert("이 뷰에서는 출석 상태를 변경할 수 없습니다.");
-                                                                                return;
-                                                                            }
-                                                                            handleInstantStatus(s, 'late');
-                                                                        }}
-                                                                        className={`h-7 px-2.5 rounded-lg text-[10px] font-black transition-all border ${s.status === 'late' ? 'text-white border-transparent' : 'bg-zinc-100/50 text-zinc-400 border-zinc-200/50 hover:bg-white hover:border-zinc-300'} ${homeworkSubView ? 'cursor-not-allowed opacity-80' : ''}`}
-                                                                        style={s.status === 'late' ? { backgroundColor: '#FCB53B' } : {}}
-                                                                    >L</button>
-                                                                    <button
-                                                                        onClick={() => {
-                                                                            if (homeworkSubView) {
-                                                                                alert("이 뷰에서는 출석 상태를 변경할 수 없습니다.");
-                                                                                return;
-                                                                            }
-                                                                            handleInstantStatus(s, 'absent');
-                                                                        }}
-                                                                        className={`h-7 px-2.5 rounded-lg text-[10px] font-black transition-all border ${s.status === 'absent' ? 'text-white border-transparent' : 'bg-zinc-100/50 text-zinc-400 border-zinc-200/50 hover:bg-white hover:border-zinc-300'} ${homeworkSubView ? 'cursor-not-allowed opacity-80' : ''}`}
-                                                                        style={s.status === 'absent' ? { backgroundColor: '#B45253' } : {}}
-                                                                    >A</button>
-                                                                </div>
+                                                                <StatusButtons session={s}
+                                                                    readOnly={!!homeworkSubView}
+                                                                    onStatus={(status) => handleInstantStatus(s, status)} />
                                                             </td>
-
-                                                            {/* 1st Check/Trial Column */}
+                                                            {/* 1st */}
                                                             <td className="px-6 py-3">
-                                                                <CourseCheckGroup
-                                                                    student={s}
+                                                                <CourseCheckGroup student={s}
                                                                     step={viewMode === 'retention' ? 'retention1' : 'homework1'}
                                                                     areas={viewMode === 'retention' ? RETENTION_AREAS : COURSEWORK_AREAS}
-                                                                    onUpdate={(area, val) => handleHomeworkCellUpdate(s, viewMode === 'retention' ? 'retention1' : 'homework1', area, val)}
                                                                     readOnly={homeworkSubView !== '1st'}
-                                                                />
+                                                                    onUpdate={(area, val) => handleHomeworkCellUpdate(s, viewMode === 'retention' ? 'retention1' : 'homework1', area, val)} />
                                                             </td>
-
-                                                            {/* 2nd Check/Trial Column */}
+                                                            {/* 2nd */}
                                                             <td className="px-6 py-3">
-                                                                <CourseCheckGroup
-                                                                    student={s}
+                                                                <CourseCheckGroup student={s}
                                                                     step={viewMode === 'retention' ? 'retention2' : 'homework2'}
                                                                     areas={viewMode === 'retention' ? RETENTION_AREAS : COURSEWORK_AREAS}
-                                                                    onUpdate={(area, val) => handleHomeworkCellUpdate(s, viewMode === 'retention' ? 'retention2' : 'homework2', area, val)}
                                                                     readOnly={homeworkSubView !== '2nd'}
-                                                                    validate1stCheck={(stu) => {
+                                                                    validate1stCheck={stu => {
                                                                         const step1 = viewMode === 'retention' ? 'retention1' : 'homework1';
-                                                                        const hw1 = stu.checks?.[step1] || {};
-                                                                        return Object.values(hw1).some(v => v);
+                                                                        return Object.values(stu.checks?.[step1] || {}).some(v => v);
                                                                     }}
-                                                                />
+                                                                    onUpdate={(area, val) => handleHomeworkCellUpdate(s, viewMode === 'retention' ? 'retention2' : 'homework2', area, val)} />
                                                             </td>
-
-                                                            {/* Next Coursework/Trial Column */}
+                                                            {/* Next */}
                                                             <td className="px-6 py-3">
-                                                                <CourseCheckGroup
-                                                                    student={s}
+                                                                <CourseCheckGroup student={s}
                                                                     step={viewMode === 'retention' ? 'retentionNext' : 'homeworkNext'}
                                                                     areas={viewMode === 'retention' ? RETENTION_AREAS : COURSEWORK_AREAS}
-                                                                    isNext={true}
-                                                                    onUpdate={(area, val) => handleHomeworkCellUpdate(s, viewMode === 'retention' ? 'retentionNext' : 'homeworkNext', area, val)}
-                                                                    readOnly={homeworkSubView !== 'next'}
-                                                                />
+                                                                    isNext readOnly={homeworkSubView !== 'next'}
+                                                                    onUpdate={(area, val) => handleHomeworkCellUpdate(s, viewMode === 'retention' ? 'retentionNext' : 'homeworkNext', area, val)} />
                                                             </td>
-                                                        </React.Fragment>
+                                                        </>
                                                     ) : (
-                                                        // Attendance View Rows (Original)
-                                                        <React.Fragment>
+                                                        // 출석 뷰
+                                                        <>
                                                             <td className="px-6 py-3 font-bold text-xs">{s.department}</td>
                                                             <td className="px-6 py-3 font-black text-[13px]">
                                                                 <div className="flex items-center gap-2">
                                                                     {s.name}
-                                                                    {s.checks?.memos?.toDesk && (
-                                                                        <button
-                                                                            onClick={(e) => {
-                                                                                e.stopPropagation();
-                                                                                setActiveMemoStudent(s);
-                                                                                setShowMemoModal(true);
-                                                                            }}
-                                                                            className="w-5 h-5 rounded-full flex items-center justify-center text-indigo-500 hover:bg-indigo-50 transition-all relative shrink-0"
-                                                                        >
-                                                                            <MessageSquare size={12} fill="currentColor" fillOpacity={0.2} />
-                                                                            <div className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-indigo-600 rounded-full border border-white" />
-                                                                        </button>
-                                                                    )}
+                                                                    <MemoIndicator student={s} onClick={() => { setActiveMemoStudent(s); setShowMemoModal(true); }} />
                                                                 </div>
                                                             </td>
                                                             <td className="px-6 py-3 text-xs font-black text-black/70">
-                                                                {s.schoolName}{s.grade}{s.classes && s.classes[0] ? `/${s.classes[0]}` : ''}
+                                                                {s.schoolName}{s.grade}{s.classes?.[0] ? `/${s.classes[0]}` : ''}
                                                             </td>
                                                             <td className="px-6 py-3">
                                                                 <div className="flex items-center gap-1.5">
-                                                                    <Clock size={12} className={s.status === 'waiting' && s.attendanceTime && s.attendanceTime < new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit' }) ? "text-red-500" : "text-zinc-300"} />
-                                                                    <span className={`text-[12px] font-black ${s.status === 'waiting' && s.attendanceTime && s.attendanceTime < new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit' }) ? "text-red-600 animate-pulse" : "text-black"}`}>
-                                                                        {s.attendanceTime || '--:--'}
-                                                                    </span>
+                                                                    <Clock size={12} className="text-zinc-300" />
+                                                                    <span className="text-[12px] font-black text-black">{s.attendanceTime || '--:--'}</span>
                                                                 </div>
                                                             </td>
                                                             <td className="px-6 py-3">
-                                                                <div className="flex gap-1 flex-wrap">
-                                                                    {s.attendanceDays && s.attendanceDays.length > 0 ? s.attendanceDays.map(d => (
-                                                                        <span key={d} className={`px-1.5 py-0.5 rounded text-[10px] font-black ${d === todayName ? 'bg-indigo-600 text-white shadow-sm ring-1 ring-indigo-600' : 'bg-zinc-100 text-zinc-500'}`}>
-                                                                            {d}
-                                                                        </span>
-                                                                    )) : <span className="text-[10px] text-zinc-300 font-bold italic">Unassigned</span>}
-                                                                </div>
+                                                                <ScheduleCell student={s} todayName={todayName} />
                                                             </td>
-
-                                                            <td className="px-6 py-3">
-                                                                <div className="flex items-center gap-1.5" onClick={e => e.stopPropagation()}>
-                                                                    <button
-                                                                        onClick={() => handleInstantStatus(s, 'attendance')}
-                                                                        className={`h-7 px-2.5 rounded-lg text-[10px] font-black transition-all border ${s.status === 'attendance' ? 'text-white border-transparent' : 'bg-zinc-100/50 text-zinc-400 border-zinc-200/50 hover:bg-white hover:border-zinc-300'}`}
-                                                                        style={s.status === 'attendance' ? { backgroundColor: '#84994F' } : {}}
-                                                                    >출석</button>
-                                                                    <button
-                                                                        onClick={() => handleInstantStatus(s, 'late')}
-                                                                        className={`h-7 px-2.5 rounded-lg text-[10px] font-black transition-all border ${s.status === 'late' ? 'text-white border-transparent' : 'bg-zinc-100/50 text-zinc-400 border-zinc-200/50 hover:bg-white hover:border-zinc-300'}`}
-                                                                        style={s.status === 'late' ? { backgroundColor: '#FCB53B' } : {}}
-                                                                    >지각</button>
-                                                                    <button
-                                                                        onClick={() => handleInstantStatus(s, 'absent')}
-                                                                        className={`h-7 px-2.5 rounded-lg text-[10px] font-black transition-all border ${s.status === 'absent' ? 'text-white border-transparent' : 'bg-zinc-100/50 text-zinc-400 border-zinc-200/50 hover:bg-white hover:border-zinc-300'}`}
-                                                                        style={s.status === 'absent' ? { backgroundColor: '#B45253' } : {}}
-                                                                    >결석</button>
-                                                                </div>
+                                                            <td className="px-6 py-3" onClick={e => e.stopPropagation()}>
+                                                                <StatusButtons session={s} onStatus={(status) => handleInstantStatus(s, status)}
+                                                                    labels={['출석', '지각', '결석']} />
                                                             </td>
-                                                        </React.Fragment>
+                                                        </>
                                                     )}
                                                 </tr>
                                             ))}
                                         </tbody>
                                     </table>
                                 ) : (
-                                    <div className="h-full flex flex-col items-center justify-center text-center p-12 bg-zinc-50/20 rounded-3xl border border-dashed border-zinc-200 m-4">
-                                        <div className="w-16 h-16 bg-white rounded-2xl shadow-sm border border-zinc-100 flex items-center justify-center mb-6">
-                                            <Users size={32} className="text-zinc-200" />
-                                        </div>
-                                        <h3 className="text-lg font-black tracking-tight text-zinc-900 mb-2">
-                                            {sessions.length === 0 ? "데이터가 비어 있습니다" : "조건에 맞는 학생이 없습니다"}
-                                        </h3>
-                                        <p className="text-sm text-zinc-500 max-w-[300px] leading-relaxed mb-8">
-                                            {sessions.length === 0
-                                                ? "상단의 'Import Data' 버튼이나 아래 버튼을 눌러 학생 정보를 먼저 추가해 주세요."
-                                                : `현재 '${todayName}요일' 등원 예정 학생이 없거나 필터와 일치하는 결과가 없습니다.`}
-                                        </p>
-                                        <div className="flex gap-3">
-                                            <button
-                                                onClick={() => { setViewMode('master'); console.log("Switched to Master"); }}
-                                                className={`h-10 px-6 bg-white border rounded-xl text-[12px] font-black hover:bg-zinc-50 transition-all shadow-sm ${viewMode === 'master' ? 'border-black ring-1 ring-black' : 'border-zinc-200'}`}
-                                            >
-                                                Master List 보기
-                                            </button>
-                                            <button
-                                                onClick={() => { setViewMode('import'); setShowExcelBridge(true); }}
-                                                className="h-10 px-6 bg-black text-white rounded-xl text-[12px] font-black hover:bg-zinc-800 transition-all shadow-lg shadow-black/10"
-                                            >
-                                                데이터 임포트하기
-                                            </button>
-                                        </div>
-                                    </div>
+                                    <EmptyState sessions={sessions} todayName={todayName} filters={filters}
+                                        onImport={() => setViewMode('import')}
+                                        onMaster={() => setViewMode('master')}
+                                        onClearFilters={() => { setSearchQuery(''); clearFiltersFromStore(); }} />
                                 )}
                             </div>
                         </div>
                     ) : (
+                        /* ── Import 뷰 ── */
                         <div className="flex-1 flex flex-col overflow-hidden bg-white">
                             {activeImportId ? (
                                 <div className="flex-1 flex flex-col min-h-0">
+                                    {/* Import 툴바 */}
                                     <div className="flex flex-col justify-center px-8 py-4 border-b border-zinc-100 bg-zinc-50/20 gap-4">
                                         <div className="flex items-center justify-between">
                                             <div className="flex items-center gap-6">
                                                 <div className="flex items-center gap-4">
-                                                    <span className="text-4xl font-black tabular-nums tracking-tighter" key={importSelectedIds.size}>
-                                                        {importSelectedIds.size}
-                                                    </span>
-                                                    <span className="text-[10px] font-black text-muted-foreground uppercase tracking-widest leading-none">
-                                                        Selected<br />Students
-                                                    </span>
+                                                    <span className="text-4xl font-black tabular-nums tracking-tighter">{importSelectedIds.size}</span>
+                                                    <span className="text-[10px] font-black text-muted-foreground uppercase tracking-widest leading-none">Selected<br />Students</span>
                                                 </div>
-                                                <div className="relative group">
+                                                <div className="relative">
                                                     <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground/40" />
-                                                    <input
-                                                        placeholder="Search staged data..."
-                                                        value={importSearchQuery}
-                                                        onChange={e => setImportSearchQuery(e.target.value)}
-                                                        className="h-8 w-60 bg-white border border-border rounded-lg pl-9 pr-3 text-[11px] focus:outline-none focus:ring-1 focus://ring-black/10 transition-all font-medium shadow-sm"
-                                                    />
+                                                    <input placeholder="Search staged data..." value={importSearchQuery} onChange={e => setImportSearchQuery(e.target.value)}
+                                                        className="h-8 w-60 bg-white border border-border rounded-lg pl-9 pr-3 text-[11px] focus:outline-none transition-all font-medium shadow-sm" />
                                                 </div>
                                             </div>
                                             <div className="flex gap-2">
-                                                <button
-                                                    onClick={async () => {
-                                                        const curr = importHistory.find(h => h.id === activeImportId);
-                                                        if (curr) {
-                                                            const success = await handleCreateSessions(curr.students);
-                                                            if (success) {
-                                                                // 히스토리에서 즉시 삭제하지 않고 상태만 변경 (사용자가 나중에 닫을 수 있도록)
-                                                                // 또는 요청대로 보관이 필요하다면 setViewMode('today')로만 이동
-                                                                setViewMode('today');
-                                                            }
-                                                        }
-                                                    }}
-                                                    className="h-8 px-6 bg-black text-white rounded-lg text-[11px] font-black transition-all flex items-center gap-2 shadow-lg shadow-black/10 opacity-20 hover:opacity-100 grayscale hover:grayscale-0"
-                                                >
-                                                    <Save size={14} /> Commit to Database
-                                                </button>
-                                                <button onClick={() => { setImportHistory(prev => prev.filter(h => h.id !== activeImportId)); setActiveImportId(null); }} className="h-8 px-4 text-destructive font-black text-[11px] hover:bg-destructive/5 rounded-lg transition-all">Discard</button>
+                                                <button onClick={() => { setImportHistory(prev => prev.filter(h => h.id !== activeImportId)); setActiveImportId(null); }}
+                                                    className="h-8 px-4 text-destructive font-black text-[11px] hover:bg-destructive/5 rounded-lg transition-all">Discard Staging</button>
                                             </div>
                                         </div>
 
-                                        <div className="bg-white/80 p-1.5 rounded-2xl border border-zinc-100 shadow-sm flex flex-col gap-0.5">
-                                            {/* 정규 줄 */}
-                                            <div className="flex items-center justify-between pl-2 pr-1 py-0.5">
-                                                <div className="flex items-center gap-4">
-                                                    <div className="flex gap-0.5">
-                                                        {['월', '화', '수', '목', '금', '토', '일'].map(d => (
-                                                            <button
-                                                                key={d}
-                                                                onClick={() => setImportBatchDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d])}
-                                                                className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all border ${importBatchDays.includes(d) ? 'bg-black text-white border-black ring-2 ring-black/5' : 'bg-transparent text-zinc-300 border-zinc-100 hover:text-black hover:border-black/40'}`}
-                                                            >
-                                                                {d}
-                                                            </button>
-                                                        ))}
-                                                    </div>
-                                                    <div className="h-4 w-[1px] bg-zinc-100" />
-                                                    <input
-                                                        type="time"
-                                                        value={importBatchTime}
-                                                        onChange={e => setImportBatchTime(e.target.value)}
-                                                        className={`h-6 px-1.5 border border-zinc-100 rounded text-[10px] font-bold focus:outline-none focus:ring-1 focus:ring-black/10 bg-zinc-50/50 transition-colors ${importBatchTime ? 'text-black' : 'text-zinc-400 hover:text-black'}`}
-                                                    />
-                                                </div>
-                                                <button
-                                                    onClick={handleApplyRegularSchedule}
-                                                    className="h-6 px-3 bg-black text-white rounded-md text-[9px] font-black transition-all flex items-center gap-1.5 shadow-sm opacity-20 hover:opacity-100 grayscale hover:grayscale-0"
-                                                >
-                                                    <Clock size={10} /> 정규 저장
-                                                </button>
-                                            </div>
-
-                                            {/* 특강 줄 */}
-                                            <div className="flex items-center justify-between pl-2 pr-1 py-0.5 border-t border-zinc-50/50">
-                                                <div className="flex items-center gap-4">
-                                                    <div className="flex gap-0.5">
-                                                        {['월', '화', '수', '목', '금', '토', '일'].map(d => (
-                                                            <button
-                                                                key={d}
-                                                                onClick={() => setImportSpecialBatchDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d])}
-                                                                className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all border ${importSpecialBatchDays.includes(d) ? 'bg-indigo-600 text-white border-indigo-600 ring-2 ring-indigo-500/10' : 'bg-transparent text-indigo-100 border-indigo-50 hover:text-indigo-600 hover:border-indigo-400'}`}
-                                                            >
-                                                                {d}
-                                                            </button>
-                                                        ))}
-                                                    </div>
-                                                    <div className="h-4 w-[1px] bg-indigo-50" />
-                                                    <div className="flex items-center gap-2">
-                                                        <input
-                                                            type="time"
-                                                            value={importSpecialBatchTime}
-                                                            onChange={e => setImportSpecialBatchTime(e.target.value)}
-                                                            className={`h-6 px-1.5 border border-indigo-50/50 rounded text-[10px] font-bold focus:outline-none focus:ring-1 focus:ring-indigo-100 bg-indigo-50/30 transition-colors ${importSpecialBatchTime ? 'text-indigo-600' : 'text-indigo-200 hover:text-indigo-600'}`}
-                                                        />
-                                                        <div className="flex items-center gap-1">
-                                                            <input
-                                                                type="date"
-                                                                value={importBatchStartDate}
-                                                                onChange={e => setImportBatchStartDate(e.target.value)}
-                                                                className={`h-6 px-1 border border-indigo-50/50 rounded text-[9px] font-bold focus:outline-none bg-indigo-50/30 transition-colors min-w-[95px] ${importBatchStartDate ? 'text-indigo-600' : 'text-indigo-200 hover:text-indigo-600'}`}
-                                                            />
-                                                            <span className="text-[10px] text-indigo-100">-</span>
-                                                            <input
-                                                                type="date"
-                                                                value={importBatchEndDate}
-                                                                onChange={e => setImportBatchEndDate(e.target.value)}
-                                                                className={`h-6 px-1 border border-indigo-50/50 rounded text-[9px] font-bold focus:outline-none bg-indigo-50/30 transition-colors min-w-[95px] ${importBatchEndDate ? 'text-indigo-600' : 'text-indigo-200 hover:text-indigo-600'}`}
-                                                            />
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                                <button
-                                                    onClick={handleApplySpecialSchedule}
-                                                    className="h-6 px-3 bg-indigo-600 text-white rounded-md text-[9px] font-black transition-all flex items-center gap-1.5 shadow-sm opacity-20 hover:opacity-100 grayscale hover:grayscale-0"
-                                                >
-                                                    <Zap size={10} /> 특강 저장
-                                                </button>
-                                            </div>
-                                        </div>
+                                        {/* 스케줄 툴바 */}
+                                        <ScheduleToolbar
+                                            batchDays={importBatchDays} setBatchDays={setImportBatchDays}
+                                            batchTime={importBatchTime} setBatchTime={setImportBatchTime}
+                                            specialDays={importSpecialBatchDays} setSpecialDays={setImportSpecialBatchDays}
+                                            specialTime={importSpecialBatchTime} setSpecialTime={setImportSpecialBatchTime}
+                                            arbitraryDays={importArbitraryBatchDays} setArbitraryDays={setImportArbitraryBatchDays}
+                                            startDate={importBatchStartDate} setStartDate={setImportBatchStartDate}
+                                            endDate={importBatchEndDate} setEndDate={setImportBatchEndDate}
+                                            onApplyRegular={handleApplyRegularSchedule}
+                                            onApplySpecial={handleApplySpecialSchedule}
+                                            onApplyArbitrary={handleApplyArbitrarySchedule}
+                                            onCommit={async () => {
+                                                const curr = importHistory.find(h => h.id === activeImportId);
+                                                if (curr) {
+                                                    const ok = await handleCreateSessions(curr.students);
+                                                    if (ok) setViewMode('today');
+                                                }
+                                            }}
+                                        />
                                     </div>
-                                    <div className="flex-1 overflow-y-auto px-8 py-6 relative">
+
+                                    {/* Import 테이블 */}
+                                    <div className="flex-1 overflow-y-auto px-8 py-6">
                                         <table className="w-full border-collapse bg-white border border-border rounded-2xl overflow-hidden">
                                             <thead className="bg-zinc-50/50 border-b border-border text-[10px] font-black text-muted-foreground uppercase tracking-widest text-left">
                                                 <tr>
                                                     <th className="px-6 py-4 w-12 text-center">
-                                                        <input
-                                                            type="checkbox"
-                                                            className="w-3.5 h-3.5 rounded accent-black"
+                                                        <input type="checkbox" className="w-3.5 h-3.5 rounded accent-black"
                                                             checked={stagedFilteredStudents.length > 0 && stagedFilteredStudents.every(s => importSelectedIds.has(s.id))}
                                                             onChange={() => {
-                                                                if (stagedFilteredStudents.every(s => importSelectedIds.has(s.id))) {
-                                                                    // Deselect only the currently filtered ones
-                                                                    const newSelection = new Set(importSelectedIds);
-                                                                    stagedFilteredStudents.forEach(s => newSelection.delete(s.id));
-                                                                    setImportSelectedIds(newSelection);
-                                                                } else {
-                                                                    // Select all currently filtered ones
-                                                                    const newSelection = new Set(importSelectedIds);
-                                                                    stagedFilteredStudents.forEach(s => newSelection.add(s.id));
-                                                                    setImportSelectedIds(newSelection);
-                                                                }
-                                                            }}
-                                                        />
+                                                                const allSelected = stagedFilteredStudents.every(s => importSelectedIds.has(s.id));
+                                                                setImportSelectedIds(prev => {
+                                                                    const n = new Set(prev);
+                                                                    stagedFilteredStudents.forEach(s => allSelected ? n.delete(s.id) : n.add(s.id));
+                                                                    return n;
+                                                                });
+                                                            }} />
                                                     </th>
                                                     <th className="px-6 py-4">소속</th>
                                                     <th className="px-6 py-4">이름</th>
@@ -2255,81 +1559,22 @@ export default function Dashboard() {
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-border/50">
-                                                {stagedFilteredStudents.map(st => {
-                                                    if (!st || !st.id) return null;
-                                                    return (
-                                                        <tr
-                                                            key={st.id}
-                                                            onClick={() => {
-                                                                setImportSelectedIds(prev => {
-                                                                    const n = new Set(prev);
-                                                                    if (n.has(st.id)) n.delete(st.id);
-                                                                    else n.add(st.id);
-                                                                    return n;
-                                                                });
-                                                            }}
-                                                            className={`group cursor-pointer transition-colors ${importSelectedIds.has(st.id) ? 'bg-zinc-100/80' : 'hover:bg-zinc-50'}`}
-                                                        >
-                                                            <td className="px-6 py-4 text-center">
-                                                                <input
-                                                                    type="checkbox"
-                                                                    checked={importSelectedIds.has(st.id)}
-                                                                    readOnly
-                                                                    className="w-3.5 h-3.5 rounded accent-black cursor-pointer pointer-events-none"
-                                                                />
-                                                            </td>
-                                                            <td className="px-6 py-4"><span className="text-[11px] font-bold px-2 py-0.5 bg-zinc-200/50 rounded-md">{st.department}</span></td>
-                                                            <td className="px-6 py-4"><p className="text-[13px] font-black tracking-tight">{st.name}</p></td>
-                                                            <td className="px-6 py-4"><p className="text-[12px] font-bold text-foreground/80">{st.classes?.[0]}</p></td>
-                                                            <td className="px-6 py-4 text-[11px] font-medium text-muted-foreground">{st.schoolName} {st.grade}</td>
-                                                            <td className="px-6 py-4">
-                                                                <div className="flex flex-col items-center gap-2">
-                                                                    {/* 정규 스택 */}
-                                                                    <div className="flex flex-col items-center gap-1">
-                                                                        <div className="flex gap-0.5 justify-center">
-                                                                            {['월', '화', '수', '목', '금', '토', '일'].map(d => {
-                                                                                const isReg = st.attendanceDays?.includes(d);
-                                                                                const isSpec = st.specialDays?.includes(d);
-                                                                                let bgColor = 'bg-transparent text-zinc-300 border border-zinc-100';
-                                                                                if (isReg && isSpec) bgColor = 'bg-emerald-400 text-white border-emerald-400 shadow-sm';
-                                                                                else if (isReg) bgColor = 'bg-black text-white border-black shadow-sm';
-
-                                                                                return <span key={d} className={`w-4.5 h-4.5 rounded-[3px] flex items-center justify-center text-[8px] font-black transition-all ${bgColor}`}>{d}</span>;
-                                                                            })}
-                                                                        </div>
-                                                                        {st.attendanceTime && (
-                                                                            <div className="flex items-center gap-1 px-1.5 py-0.5 bg-zinc-100 rounded text-[9px] font-bold text-black border border-zinc-200">
-                                                                                <Clock size={8} /> {st.attendanceTime}
-                                                                            </div>
-                                                                        )}
-                                                                    </div>
-
-                                                                    {/* 특강 스택 */}
-                                                                    {(st.specialDays?.length > 0 || st.specialTime) && (
-                                                                        <div className="flex flex-col items-center gap-1 pt-1.5 border-t border-zinc-100 w-full">
-                                                                            <div className="flex gap-0.5 justify-center">
-                                                                                {['월', '화', '수', '목', '금', '토', '일'].map(d => {
-                                                                                    const isReg = st.attendanceDays?.includes(d);
-                                                                                    const isSpec = st.specialDays?.includes(d);
-                                                                                    let bgColor = 'bg-transparent text-indigo-100 border border-indigo-50';
-                                                                                    if (isReg && isSpec) bgColor = 'bg-emerald-400 text-white border-emerald-400 shadow-sm';
-                                                                                    else if (isSpec) bgColor = 'bg-indigo-600 text-white border-indigo-600 shadow-sm';
-
-                                                                                    return <span key={d} className={`w-4.5 h-4.5 rounded-[3px] flex items-center justify-center text-[8px] font-black transition-all ${bgColor}`}>{d}</span>;
-                                                                                })}
-                                                                            </div>
-                                                                            {st.specialTime && (
-                                                                                <div className="flex items-center gap-1 px-1.5 py-0.5 bg-indigo-50 rounded text-[9px] font-bold text-indigo-700 border border-indigo-100">
-                                                                                    <Zap size={8} /> {st.specialTime}
-                                                                                </div>
-                                                                            )}
-                                                                        </div>
-                                                                    )}
-                                                                </div>
-                                                            </td>
-                                                        </tr>
-                                                    );
-                                                })}
+                                                {stagedFilteredStudents.map(st => (
+                                                    <tr key={st.id}
+                                                        onClick={() => { setActiveProfileStudent(st); setShowProfileModal(true); }}
+                                                        className={`cursor-pointer transition-colors ${importSelectedIds.has(st.id) ? 'bg-zinc-100/80' : 'hover:bg-zinc-50'}`}>
+                                                        <td className="px-6 py-4 text-center" onClick={(e) => { e.stopPropagation(); setImportSelectedIds(prev => { const n = new Set(prev); n.has(st.id) ? n.delete(st.id) : n.add(st.id); return n; }); }}>
+                                                            <input type="checkbox" checked={importSelectedIds.has(st.id)} readOnly className="w-3.5 h-3.5 rounded accent-black pointer-events-none" />
+                                                        </td>
+                                                        <td className="px-6 py-4"><span className="text-[11px] font-bold px-2 py-0.5 bg-zinc-200/50 rounded-md">{st.department}</span></td>
+                                                        <td className="px-6 py-4"><p className="text-[13px] font-black tracking-tight">{st.name}</p></td>
+                                                        <td className="px-6 py-4"><p className="text-[12px] font-bold text-foreground/80">{st.classes?.[0]}</p></td>
+                                                        <td className="px-6 py-4 text-[11px] font-medium text-muted-foreground">{st.schoolName} {st.grade}</td>
+                                                        <td className="px-6 py-4">
+                                                            <ScheduleCell student={st} todayName={todayName} showHighlight={false} />
+                                                        </td>
+                                                    </tr>
+                                                ))}
                                             </tbody>
                                         </table>
                                     </div>
@@ -2342,164 +1587,166 @@ export default function Dashboard() {
                                 </div>
                             )}
                         </div>
-                    )
-                    }
-                </div >
-            </main >
-
-            {/* Modal/Panel Sections Removed - Integrated into Sidebar */}
-        </div >
+                    )}
+                </div>
+            </main>
+        </div>
     );
 }
 
-// Subcomponents
+// ─── 서브 컴포넌트 ────────────────────────────────────────────────────────────
+
+/** 네비게이션 아이템 */
+function NavItem({ icon, label, active, onClick, hasDropdown, isExpanded }) {
+    return (
+        <div onClick={onClick} className={`flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-all ${active ? 'bg-zinc-100 text-black shadow-sm' : 'text-muted-foreground hover:text-foreground hover:bg-zinc-50'}`}>
+            <div className={active ? 'text-black' : 'text-muted-foreground'}>{icon}</div>
+            <span className="text-sm font-bold truncate flex-1">{label}</span>
+            {hasDropdown && <ChevronDown size={14} className={`transition-transform duration-200 ${isExpanded ? 'rotate-180' : ''}`} />}
+        </div>
+    );
+}
+
+/** 사이드바 서브 네비게이션 */
+function SubNavItem({ label, active, onClick }) {
+    return (
+        <div onClick={onClick}
+            className={`px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer transition-all ${active ? 'bg-black text-white' : 'text-zinc-400 hover:text-black hover:bg-zinc-50'}`}>
+            {label}
+        </div>
+    );
+}
+
+/** Import 패널 (아코디언) */
+function ImportPanel({ label, icon, open, onToggle, children }) {
+    return (
+        <div className={`group rounded-xl transition-all duration-200 overflow-hidden ${open ? 'bg-zinc-50' : 'hover:bg-zinc-50'}`}>
+            <button onClick={onToggle}
+                className="w-full h-11 flex items-center justify-between px-4 py-3 text-left bg-white hover:bg-zinc-50/50 transition-colors">
+                <div className="flex items-center gap-3">
+                    <div className={`w-7 h-7 rounded-md flex items-center justify-center transition-colors ${open ? 'bg-black text-white' : 'text-zinc-400 group-hover:text-black'}`}>
+                        {icon}
+                    </div>
+                    <span className={`text-[12px] font-bold transition-colors ${open ? 'text-black' : 'text-zinc-500 group-hover:text-black'}`}>{label}</span>
+                </div>
+                <ChevronDown size={14} className={`text-zinc-300 transition-transform duration-300 ${open ? 'rotate-180 text-black' : 'group-hover:text-zinc-500'}`} />
+            </button>
+            {open && children}
+        </div>
+    );
+}
+
+/** 폼 행 (라벨 + 인풋) */
+function FormRow({ label, children }) {
+    return (
+        <div className="space-y-1">
+            <label className="text-[10px] font-bold text-zinc-500 uppercase ml-1">{label}</label>
+            {children}
+        </div>
+    );
+}
+
+/** 섹션 구분선 */
+function SectionDivider({ label }) {
+    return (
+        <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest mb-2 flex items-center gap-2 px-1 py-1">
+            <span className="h-[1px] flex-1 bg-zinc-100" />{label}<span className="h-[1px] flex-1 bg-zinc-100" />
+        </p>
+    );
+}
+
+/** 사이드바 input */
 function SidebarInput({ ...props }) {
     return (
         <input {...props} className="w-full bg-white border border-border rounded-lg px-3 py-2 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-black/10 transition-all font-medium placeholder:text-muted-foreground/30 shadow-sm" />
     );
 }
 
-// Helper component for Coursework/Retention Cells
-function CourseCheckGroup({ student, step, areas, isNext, onUpdate, readOnly, validate1stCheck }) {
-    const data = student.checks[step] || {};
-
+/** 메모 아이콘 인디케이터 */
+function MemoIndicator({ student, onClick }) {
+    if (!student.checks?.memos?.toDesk) return null;
     return (
-        <div className="flex justify-center gap-1" onClick={e => e.stopPropagation()}>
-            {areas.map(area => {
-                const status = data[area.key];
-                let bg = 'bg-zinc-100 text-zinc-300';
-
-                if (isNext) {
-                    // stored = Green, empty = Default
-                    if (status) bg = 'bg-[#84994F] text-white';
-                } else {
-                    // o=Green, triangle=Orange, x=Red
-                    if (status === 'o') bg = 'bg-[#84994F] text-white';
-                    else if (status === 'triangle') bg = 'bg-[#FCB53B] text-white';
-                    else if (status === 'x') bg = 'bg-[#B45253] text-white';
-                }
-
-                return (
-                    <button
-                        key={area.key}
-                        onClick={() => {
-                            if (readOnly) {
-                                alert("이 뷰에서는 입력이 허용되지 않습니다.");
-                                return;
-                            }
-
-                            // Check validation for 2nd check/trial
-                            if ((step.endsWith('2')) && validate1stCheck) {
-                                if (!validate1stCheck(student)) {
-                                    alert("1st 단계가 완료되지 않았습니다. 먼저 1st 단계를 입력해주세요.");
-                                    return;
-                                }
-                            }
-
-                            if (isNext) {
-                                // Toggle for Next
-                                onUpdate(area.key, status ? null : 'o'); // 'o' as simple marker
-                            } else {
-                                // Cycle: null -> o -> triangle -> x -> null
-                                const order = [null, 'o', 'triangle', 'x'];
-                                const idx = order.indexOf(status || null);
-                                const next = order[(idx + 1) % order.length];
-                                onUpdate(area.key, next);
-                            }
-                        }}
-                        className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all ${bg} hover:brightness-95 ${readOnly ? 'cursor-not-allowed opacity-80' : ''}`}
-                    >
-                        {area.label}
-                    </button>
-                );
-            })}
-        </div>
+        <button onClick={e => { e.stopPropagation(); onClick(); }}
+            className="w-5 h-5 rounded-full flex items-center justify-center text-indigo-500 hover:bg-indigo-50 transition-all relative shrink-0">
+            <MessageSquare size={12} fill="currentColor" fillOpacity={0.2} />
+            <div className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-indigo-600 rounded-full border border-white" />
+        </button>
     );
 }
 
-function NavItem({ icon, label, active, onClick, hasDropdown, isExpanded }) {
-    return (
-        <div onClick={onClick} className={`flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-all ${active ? 'bg-zinc-100 text-black shadow-sm' : 'text-muted-foreground hover:text-foreground hover:bg-zinc-50'}`}>
-            <div className={active ? 'text-black' : 'text-muted-foreground'}>{icon}</div>
-            <span className="text-sm font-bold truncate flex-1">{label}</span>
-            {hasDropdown && (
-                <ChevronDown size={14} className={`transition-transform duration-200 ${isExpanded ? 'rotate-180' : ''}`} />
-            )}
-        </div>
-    );
-}
-
-function SectionTitle({ title, noMargin }) {
-    return <h3 className={`text-[10px] font-black text-muted-foreground uppercase tracking-[0.15em] ${noMargin ? '' : 'mb-4'}`}>{title}</h3>;
-}
-
-function CheckRow({ label, value, onChange }) {
-    const options = [
-        { id: 'o', icon: <Check size={14} />, color: 'peer-checked:bg-green-500 peer-checked:text-white' },
-        { id: 'triangle', icon: <span className="text-[10px] font-bold">▲</span>, color: 'peer-checked:bg-yellow-500 peer-checked:text-white' },
-        { id: 'x', icon: <X size={14} />, color: 'peer-checked:bg-red-500 peer-checked:text-white' },
-        { id: 'none', icon: <X size={14} className="rotate-45" />, color: 'peer-checked:bg-zinc-400 peer-checked:text-white' }
+/** 출석 상태 버튼 그룹 */
+function StatusButtons({ session, readOnly, onStatus, labels = ['P', 'L', 'A'] }) {
+    const configs = [
+        { status: 'attendance', color: '#84994F' },
+        { status: 'late', color: '#FCB53B' },
+        { status: 'absent', color: '#B45253' },
     ];
     return (
-        <div className="flex items-center justify-between p-4 bg-white rounded-xl border border-border shadow-sm">
-            <span className="text-sm font-bold text-foreground">{label}</span>
-            <div className="flex gap-2">
-                {options.map(opt => (
-                    <label key={opt.id} className="cursor-pointer">
-                        <input type="radio" name={label} value={opt.id} checked={value === opt.id} onChange={() => onChange(opt.id)} className="hidden peer" />
-                        <div className={`w-9 h-9 rounded-lg bg-zinc-50 text-muted-foreground/40 flex items-center justify-center transition-all ${opt.color} hover:bg-zinc-100`}>
-                            {opt.icon}
-                        </div>
-                    </label>
-                ))}
+        <div className="flex items-center gap-1.5" onClick={e => e.stopPropagation()}>
+            {configs.map(({ status, color }, i) => (
+                <button key={status}
+                    onClick={() => {
+                        if (readOnly) {
+                            toast.warning('이 뷰에서는 출석 상태를 변경할 수 없습니다.');
+                            return;
+                        }
+                        onStatus(status);
+                    }}
+                    className={`h-7 px-2.5 rounded-lg text-[10px] font-black transition-all border ${session.status === status ? 'text-white border-transparent' : 'bg-zinc-100/50 text-zinc-400 border-zinc-200/50 hover:bg-white hover:border-zinc-300'} ${readOnly ? 'cursor-not-allowed opacity-80' : ''}`}
+                    style={session.status === status ? { backgroundColor: color } : {}}>
+                    {labels[i]}
+                </button>
+            ))}
+        </div>
+    );
+}
+
+/** 검색 결과 없음 */
+function EmptyState({ sessions, todayName, filters, onImport, onMaster, onClearFilters }) {
+    const hasActiveFilters = filters.departments.length > 0 || filters.grades.length > 0 || filters.class !== 'All' || filters.school !== 'All' || filters.searchQuery !== '';
+    return (
+        <div className="flex flex-col items-center justify-center py-20 px-8 text-center bg-zinc-50/50 rounded-3xl border border-dashed border-zinc-200 m-8">
+            <div className="w-16 h-16 bg-white rounded-2xl shadow-sm flex items-center justify-center mb-6 ring-1 ring-zinc-100">
+                <Search size={32} className="text-zinc-200" />
+            </div>
+            <h3 className="text-sm font-bold text-zinc-900 mb-2">찾으시는 학생이 없나요?</h3>
+            <p className="text-[11px] text-zinc-500 max-w-[240px] leading-relaxed mb-8">
+                {hasActiveFilters ? "활성화된 필터나 검색어로 인해 학생이 표시되지 않을 수 있습니다. 필터를 초기화하거나 스테이징에서 데이터를 가져와보세요." : "오늘 등원하는 학생이 아직 없습니다. 스테이징(Import Hub)에서 데이터를 가져오거나 마스터 목록에서 명단을 확인해보세요."}
+            </p>
+            <div className="flex gap-3">
+                <button onClick={onMaster}
+                    className="h-10 px-6 bg-white border border-zinc-200 rounded-xl text-[12px] font-black hover:bg-zinc-50 transition-all shadow-sm">
+                    Master List 보기
+                </button>
+                <button onClick={onImport}
+                    className="h-10 px-6 bg-black text-white rounded-xl text-[12px] font-black hover:bg-zinc-800 transition-all shadow-lg shadow-black/10">
+                    데이터 임포트하기
+                </button>
             </div>
         </div>
     );
 }
 
-function HwInput({ label, value, onChange }) {
-    return (
-        <div className="bg-white p-3 rounded-xl border border-border shadow-sm">
-            <label className="text-[9px] font-black text-muted-foreground uppercase tracking-widest mb-1 block">{label}</label>
-            <input value={value} onChange={e => onChange(e.target.value)} className="w-full bg-transparent text-sm text-foreground focus:outline-none placeholder:text-muted-foreground/20" placeholder="..." />
-        </div>
-    );
-}
-
-function BulkGroup({ label, onUpdate }) {
-    return (
-        <div className="flex items-center gap-2">
-            <span className="text-[9px] font-black text-muted-foreground uppercase tracking-tight">{label}</span>
-            <div className="flex gap-1">
-                <button onClick={() => onUpdate('o')} className="w-7 h-7 rounded-lg border border-border bg-zinc-50 text-green-600 hover:bg-green-500 hover:text-white transition-all flex items-center justify-center"><Check size={12} /></button>
-                <button onClick={() => onUpdate('triangle')} className="w-7 h-7 rounded-lg border border-border bg-zinc-50 text-yellow-600 hover:bg-yellow-500 hover:text-white transition-all flex items-center justify-center text-[10px] font-bold">▲</button>
-                <button onClick={() => onUpdate('x')} className="w-7 h-7 rounded-lg border border-border bg-zinc-50 text-red-600 hover:bg-red-500 hover:text-white transition-all flex items-center justify-center"><X size={12} /></button>
-            </div>
-        </div>
-    );
-}
-
+/** 필터 셀렉트 */
 function FilterSelect({ label, value, options, onChange }) {
     return (
         <div className="space-y-1">
             <label className="text-[9px] font-bold text-muted-foreground uppercase ml-1">{label}</label>
-            <select value={value} onChange={e => onChange(e.target.value)} className="w-full bg-white border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-black/10 transition-all cursor-pointer font-medium shadow-sm">
+            <select value={value} onChange={e => onChange(e.target.value)}
+                className="w-full bg-white border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-black/10 transition-all cursor-pointer font-medium shadow-sm">
                 {options.map(opt => <option key={opt} value={opt}>{opt === 'All' ? `All ${label}s` : opt}</option>)}
             </select>
         </div>
     );
 }
 
+/** 요일 선택기 */
 function DayPicker({ selectedDays, onToggle }) {
-    const days = ['월', '화', '수', '목', '금', '토', '일'];
     return (
         <div className="flex justify-between bg-zinc-50 p-1 rounded-lg border border-border">
-            {days.map(d => (
-                <button
-                    key={d}
-                    onClick={() => onToggle(d)}
-                    className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all ${selectedDays.includes(d) ? 'bg-black text-white shadow-md' : 'text-muted-foreground hover:bg-white hover:text-black'}`}
-                >
+            {DAYS.map(d => (
+                <button key={d} onClick={() => onToggle(d)}
+                    className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all ${selectedDays.includes(d) ? 'bg-black text-white shadow-md' : 'text-muted-foreground hover:bg-white hover:text-black'}`}>
                     {d}
                 </button>
             ))}
@@ -2507,31 +1754,344 @@ function DayPicker({ selectedDays, onToggle }) {
     );
 }
 
-function createBlankSession(data) {
-    const schoolParts = String(data.schoolGrade || "").split(' ');
-    return {
-        id: data.id || (Date.now().toString() + Math.random().toString(36).substring(2, 9)),
-        studentId: "st_" + Math.random().toString(36).substring(2, 7),
-        name: (data.name || "Unknown").trim(),
-        department: data.department || "기타",
-        parentPhones: data.parentPhones || [],
-        studentPhones: data.studentPhones || [],
-        classes: data.classes || ["Unassigned"],
-        attendanceDays: data.attendanceDays || [],
-        attendanceTime: data.attendanceTime || "",
-        schoolName: schoolParts[0] || "",
-        grade: schoolParts.slice(1).join(' ') || "",
-        status: "waiting",
-        backlogCount: 0,
-        lastEditedBy: "Teacher Kim",
-        checks: {
-            basic: { voca: "none", idiom: "none", step3: "none", isc: "none" },
-            homework: { reading: "none", grammar: "none", practice: "none", listening: "none", etc: "none" },
-            review: { reading: "none", grammar: "none", practice: "none", listening: "none" },
-            nextHomework: { reading: "", grammar: "", practice: "", listening: "", extra: "" },
-            memos: { toDesk: "", fromDesk: "", toParent: "" },
-            homeworkResult: "none",
-            summaryConfirmed: false
+/** Import 스케줄 툴바 */
+function ScheduleToolbar({ batchDays, setBatchDays, batchTime, setBatchTime,
+    specialDays, setSpecialDays, specialTime, setSpecialTime,
+    arbitraryDays, setArbitraryDays,
+    startDate, setStartDate, endDate, setEndDate,
+    onApplyRegular, onApplySpecial, onApplyArbitrary, onCommit }) {
+    return (
+        <div className="flex gap-4 items-stretch">
+            <div className="flex-1 bg-white/80 p-1.5 rounded-2xl border border-zinc-100 shadow-sm flex flex-col gap-0.5">
+                {/* 정규 줄 */}
+                <div className="flex items-center justify-between pl-2 pr-1 py-0.5">
+                    <div className="flex items-center gap-4">
+                        <div className="flex gap-0.5">
+                            {DAYS.map(d => (
+                                <button key={d} onClick={() => setBatchDays(p => p.includes(d) ? p.filter(x => x !== d) : [...p, d])}
+                                    className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all border ${batchDays.includes(d) ? 'bg-black text-white border-black ring-2 ring-black/5' : 'bg-transparent text-zinc-300 border-zinc-100 hover:text-black hover:border-black/40'}`}>
+                                    {d}
+                                </button>
+                            ))}
+                        </div>
+                        <div className="h-4 w-[1px] bg-zinc-100" />
+                        <input type="time" value={batchTime} onChange={e => setBatchTime(e.target.value)}
+                            className={`h-6 px-1.5 border border-zinc-100 rounded text-[10px] font-bold focus:outline-none bg-zinc-50/50 ${batchTime ? 'text-black' : 'text-zinc-400'}`} />
+                    </div>
+                    <button onClick={onApplyRegular} className="h-6 px-3 bg-black text-white rounded-md text-[9px] font-black transition-all flex items-center gap-1.5 shadow-sm hover:scale-105 active:scale-95">
+                        <Clock size={10} /> 정규 입력
+                    </button>
+                </div>
+                {/* 특강 줄 */}
+                <div className="flex items-center justify-between pl-2 pr-1 py-0.5 border-t border-zinc-50/50">
+                    <div className="flex items-center gap-4">
+                        <div className="flex gap-0.5">
+                            {DAYS.map(d => (
+                                <button key={d} onClick={() => setSpecialDays(p => p.includes(d) ? p.filter(x => x !== d) : [...p, d])}
+                                    className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all border ${specialDays.includes(d) ? 'bg-indigo-600 text-white border-indigo-600 ring-2 ring-indigo-500/10' : 'bg-transparent text-indigo-100 border-indigo-50 hover:text-indigo-600 hover:border-indigo-400'}`}>
+                                    {d}
+                                </button>
+                            ))}
+                        </div>
+                        <div className="h-4 w-[1px] bg-indigo-50" />
+                        <div className="flex items-center gap-2">
+                            <input type="time" value={specialTime} onChange={e => setSpecialTime(e.target.value)}
+                                className={`h-6 px-1.5 border border-indigo-50/50 rounded text-[10px] font-bold focus:outline-none bg-indigo-50/30 ${specialTime ? 'text-indigo-600' : 'text-indigo-200'}`} />
+                            <div className="flex items-center gap-1">
+                                <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
+                                    className={`h-6 px-1 border border-indigo-50/50 rounded text-[9px] font-bold focus:outline-none bg-indigo-50/30 min-w-[95px] ${startDate ? 'text-indigo-600' : 'text-indigo-200'}`} />
+                                <span className="text-[10px] text-indigo-100">-</span>
+                                <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
+                                    className={`h-6 px-1 border border-indigo-50/50 rounded text-[9px] font-bold focus:outline-none bg-indigo-50/30 min-w-[95px] ${endDate ? 'text-indigo-600' : 'text-indigo-200'}`} />
+                            </div>
+                        </div>
+                    </div>
+                    <button onClick={onApplySpecial} className="h-6 px-3 bg-indigo-600 text-white rounded-md text-[9px] font-black transition-all flex items-center gap-1.5 shadow-sm hover:scale-105 active:scale-95">
+                        <Zap size={10} /> 특강 입력
+                    </button>
+                </div>
+                {/* 임의 줄 */}
+                <div className="flex items-center justify-between pl-2 pr-1 py-0.5 border-t border-zinc-50/50">
+                    <div className="flex items-center gap-4">
+                        <div className="flex gap-0.5">
+                            {DAYS.map(d => (
+                                <button key={d} onClick={() => setArbitraryDays(p => p.includes(d) ? p.filter(x => x !== d) : [...p, d])}
+                                    className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-black transition-all border ${arbitraryDays.includes(d) ? 'bg-orange-500 text-white border-orange-500 shadow-md' : 'bg-transparent text-orange-100 border-orange-50 hover:text-orange-600 hover:border-orange-400'}`}>
+                                    {d}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                    <button onClick={onApplyArbitrary} className="h-6 px-3 bg-orange-500 text-white rounded-md text-[9px] font-black transition-all flex items-center gap-1.5 shadow-sm hover:scale-105 active:scale-95">
+                        <Plus size={10} /> 임의 입력
+                    </button>
+                </div>
+            </div>
+
+            {/* 서버 저장 버튼 (우측에 통합) */}
+            <button onClick={onCommit}
+                className="w-32 bg-gradient-to-br from-indigo-600 to-violet-700 hover:from-indigo-700 hover:to-violet-800 text-white rounded-2xl flex flex-col items-center justify-center gap-2 shadow-xl shadow-indigo-200 transition-all hover:scale-[1.02] active:scale-[0.98]">
+                <Save size={20} />
+                <span className="font-black text-[12px] uppercase tracking-wider text-center px-2 leading-tight">서버에 저장</span>
+                <div className="px-2 py-0.5 bg-white/20 rounded-full text-[8px] font-bold">COMMIT</div>
+            </button>
+        </div>
+    );
+}
+
+/** Import 테이블 스케줄 셀 */
+function ScheduleCell({ student: st, todayName, showHighlight = true }) {
+    return (
+        <div className="flex flex-col items-center gap-1">
+            <div className="flex gap-0.5 justify-center items-center">
+                {DAYS.map(d => {
+                    const isReg = isDayMatch(st.attendanceDays, d);
+                    const isSpec = isDayMatch(st.specialDays, d);
+                    const isExtra = isDayMatch(st.extraDays, d);
+
+                    const count = [isReg, isSpec, isExtra].filter(Boolean).length;
+
+                    let bg = 'bg-transparent text-zinc-200 border-zinc-100';
+                    if (count >= 2) bg = 'bg-black text-white border-black';
+                    else if (isReg) bg = 'bg-emerald-500 text-white border-emerald-500';
+                    else if (isSpec) bg = 'bg-indigo-600 text-white border-indigo-600';
+                    else if (isExtra) bg = 'bg-orange-500 text-white border-orange-500';
+
+                    const isToday = showHighlight && d === todayName;
+                    const size = isToday ? 'w-5 h-5 text-[10px]' : 'w-4 h-4 text-[8px]';
+                    const todayBorder = isToday ? 'border-zinc-900 border-2 shadow-sm' : 'border';
+
+                    return (
+                        <span key={d} className={`${size} rounded-[3px] flex items-center justify-center font-black ${bg} ${todayBorder} transition-all`}>
+                            {d}
+                        </span>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+/** 학생 프로필 모달 (우측 슬라이드 패널) */
+function ProfileModal({ student, show, onClose, onUpdate, todayName, showHighlight = true }) {
+    const [pendingTasks, setPendingTasks] = useState('');
+
+    if (!show || !student) return null;
+
+    const handleSaveTasks = () => {
+        if (pendingTasks.trim()) {
+            const updated = {
+                ...student,
+                checks: {
+                    ...student.checks,
+                    memos: {
+                        ...student.checks?.memos,
+                        pendingTasks: pendingTasks.trim()
+                    }
+                }
+            };
+            onUpdate(updated);
+            setPendingTasks('');
         }
     };
+
+    return (
+        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex justify-end z-[100]" onClick={onClose}>
+            <div
+                className="bg-white w-full max-w-[400px] h-full shadow-2xl flex flex-col animate-in slide-in-from-right duration-300"
+                onClick={e => e.stopPropagation()}
+            >
+                {/* Header */}
+                <div className="bg-zinc-900 px-6 py-6 flex items-center justify-between shrink-0">
+                    <div>
+                        <h2 className="text-xl font-black text-white tracking-tight">{student.name}</h2>
+                        <p className="text-sm font-medium text-zinc-300 mt-0.5">
+                            {student.schoolName} {student.grade} {student.classes?.[0] && `/ ${student.classes[0]}`}
+                        </p>
+                    </div>
+                    <button onClick={onClose} className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center transition-all">
+                        <span className="text-white text-xl font-bold">×</span>
+                    </button>
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 overflow-y-auto p-6 space-y-5">
+                    {/* Basic Info */}
+                    <Section title="기본 정보">
+                        <InfoRow label="소속" value={student.department || '-'} />
+                        <InfoRow label="학번" value={student.studentId || '-'} />
+                        <InfoRow label="스케줄" value={
+                            <div className="flex flex-col gap-2">
+                                <div className="flex gap-1.5 items-center justify-center">
+                                    {DAYS.map(d => {
+                                        const isReg = isDayMatch(student.attendanceDays, d);
+                                        const isSpec = isDayMatch(student.specialDays, d);
+                                        const isExtra = isDayMatch(student.extraDays, d);
+                                        const count = [isReg, isSpec, isExtra].filter(Boolean).length;
+
+                                        let bg = 'bg-transparent text-zinc-300 border border-zinc-100';
+                                        if (count >= 2) bg = 'bg-black text-white border-black';
+                                        else if (isReg) bg = 'bg-emerald-500 text-white border-emerald-500';
+                                        else if (isSpec) bg = 'bg-indigo-600 text-white border-indigo-600';
+                                        else if (isExtra) bg = 'bg-orange-500 text-white border-orange-500';
+
+                                        const isToday = showHighlight && d === todayName;
+                                        const size = isToday ? 'w-8 h-8 text-[12px]' : 'w-7 h-7 text-[11px]';
+                                        return (
+                                            <div key={d} className={`${size} rounded-md flex items-center justify-center font-black ${bg} border ${isToday ? 'border-zinc-900 border-2 shadow-md' : ''} transition-all`}>
+                                                {d}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        } />
+                    </Section>
+
+                    {/* Attendance Status */}
+                    <Section title="출석 현황">
+                        <div className="grid grid-cols-3 gap-2">
+                            <StatusBadge label="출석" value={student.status === 'attendance'} color="green" />
+                            <StatusBadge label="지각" value={student.status === 'late'} color="yellow" />
+                            <StatusBadge label="결석" value={student.status === 'absent'} color="red" />
+                        </div>
+                    </Section>
+
+                    {/* Coursework Status */}
+                    {(student.checks?.homework1 || student.checks?.homework2 || student.checks?.homeworkNext) && (
+                        <Section title="Coursework 현황">
+                            <CheckStatusGrid
+                                step1={student.checks?.homework1}
+                                step2={student.checks?.homework2}
+                                stepNext={student.checks?.homeworkNext}
+                                areas={COURSEWORK_AREAS}
+                            />
+                        </Section>
+                    )}
+
+                    {/* Retention Status */}
+                    {(student.checks?.retention1 || student.checks?.retention2 || student.checks?.retentionNext) && (
+                        <Section title="Retention 현황">
+                            <CheckStatusGrid
+                                step1={student.checks?.retention1}
+                                step2={student.checks?.retention2}
+                                stepNext={student.checks?.retentionNext}
+                                areas={RETENTION_AREAS}
+                            />
+                        </Section>
+                    )}
+
+                    {/* Memos */}
+                    {student.checks?.memos?.toDesk && (
+                        <Section title="메모">
+                            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg">
+                                <p className="text-sm text-amber-900 whitespace-pre-wrap">{student.checks.memos.toDesk}</p>
+                            </div>
+                        </Section>
+                    )}
+
+                    {/* Pending Tasks */}
+                    {student.checks?.memos?.pendingTasks && (
+                        <Section title="Pending Tasks">
+                            <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                                <p className="text-sm text-blue-900 whitespace-pre-wrap">{student.checks.memos.pendingTasks}</p>
+                            </div>
+                        </Section>
+                    )}
+
+                    {/* Pending Tasks Input */}
+                    <Section title="Pending Tasks 추가">
+                        <div className="space-y-2">
+                            <textarea
+                                value={pendingTasks}
+                                onChange={e => setPendingTasks(e.target.value)}
+                                placeholder="새로운 pending task를 입력하세요..."
+                                className="w-full px-3 py-2 border border-zinc-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
+                                rows={3}
+                            />
+                            <button
+                                onClick={handleSaveTasks}
+                                disabled={!pendingTasks.trim()}
+                                className="w-full px-4 py-2 bg-indigo-600 text-white text-sm font-bold rounded-lg hover:bg-indigo-700 disabled:bg-zinc-300 disabled:cursor-not-allowed transition-all"
+                            >
+                                저장
+                            </button>
+                        </div>
+                    </Section>
+                </div>
+            </div>
+        </div>
+    );
 }
+
+/** Section wrapper */
+function Section({ title, children }) {
+    return (
+        <div className="space-y-2">
+            <h3 className="text-xs font-black text-zinc-500 uppercase tracking-wider">{title}</h3>
+            <div className="space-y-2">
+                {children}
+            </div>
+        </div>
+    );
+}
+
+/** Info row */
+function InfoRow({ label, value }) {
+    return (
+        <div className="flex items-start gap-3 py-2 border-b border-zinc-100 last:border-0">
+            <span className="text-xs font-bold text-zinc-500 w-24 shrink-0">{label}</span>
+            <div className="text-sm font-medium text-zinc-900 flex-1">{value || '-'}</div>
+        </div>
+    );
+}
+
+/** Status badge */
+function StatusBadge({ label, value, color }) {
+    const colors = {
+        green: value ? 'bg-emerald-100 text-emerald-700 border-emerald-300' : 'bg-zinc-50 text-zinc-400 border-zinc-200',
+        yellow: value ? 'bg-amber-100 text-amber-700 border-amber-300' : 'bg-zinc-50 text-zinc-400 border-zinc-200',
+        red: value ? 'bg-rose-100 text-rose-700 border-rose-300' : 'bg-zinc-50 text-zinc-400 border-zinc-200',
+    };
+    return (
+        <div className={`px-3 py-2 rounded-lg border text-center text-xs font-bold ${colors[color]}`}>
+            {label}
+        </div>
+    );
+}
+
+/** Check status grid */
+function CheckStatusGrid({ step1, step2, stepNext, areas }) {
+    return (
+        <div className="grid grid-cols-4 gap-2 text-[10px]">
+            <div className="font-black text-zinc-500 uppercase">Area</div>
+            <div className="font-black text-zinc-500 uppercase text-center">1st</div>
+            <div className="font-black text-zinc-500 uppercase text-center">2nd</div>
+            <div className="font-black text-zinc-500 uppercase text-center">Next</div>
+
+            {areas.map(area => (
+                <React.Fragment key={area.key}>
+                    <div className="font-bold text-zinc-700">{area.label}</div>
+                    <div className="text-center">
+                        {step1?.[area.key] ? <CheckIcon checked={step1[area.key]} /> : '-'}
+                    </div>
+                    <div className="text-center">
+                        {step2?.[area.key] ? <CheckIcon checked={step2[area.key]} /> : '-'}
+                    </div>
+                    <div className="text-center">
+                        {stepNext?.[area.key] ? <CheckIcon checked={stepNext[area.key]} /> : '-'}
+                    </div>
+                </React.Fragment>
+            ))}
+        </div>
+    );
+}
+
+/** Check icon helper */
+function CheckIcon({ checked }) {
+    if (checked === 'none' || !checked) return <span className="text-zinc-300">○</span>;
+    if (checked === 'check') return <span className="text-emerald-600">✓</span>;
+    if (checked === 'cross') return <span className="text-rose-600">✗</span>;
+    return <span className="text-zinc-300">-</span>;
+}
+
